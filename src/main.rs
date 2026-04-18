@@ -39,7 +39,8 @@ impl std::fmt::Display for ProviderKind {
 #[derive(Debug, Parser)]
 #[command(
     name = "reviewer",
-    about = "Worktree-based PR review harness that shells out to Codex or Claude."
+    about = "Worktree-based PR review harness that shells out to Codex or Claude.",
+    after_help = "Example:\n  reviewer \\\n    --provider claude \\\n    --extra-args \"--dangerously-enable-internet-mode --dangerously-skip-permissions\" \\\n    --pr \"https://github.com/pytorch/pytorch/pull/180697\""
 )]
 struct Args {
     #[arg(long, value_enum)]
