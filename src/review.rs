@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -13,9 +14,11 @@ use crate::github::{fetch_pr_details, find_recent_prs_for_file};
 use crate::progress::ProgressReporter;
 use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
+use crate::shell::capture_command_with_input;
 use crate::types::{
-    ContextReviewDraft, FileAggregate, FileReviewDraft, FileReviewJob, FinalReviewReport,
-    HistoricalCommit, HistoricalPr, PullRequestDetails, sort_findings,
+    CheckExecution, CheckPlanDraft, ContextReviewDraft, FileAggregate, FileReviewDraft,
+    FileReviewJob, FinalReviewDraft, FinalReviewReport, HistoricalCommit, HistoricalPr,
+    PullRequestDetails, sort_findings,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,7 @@ pub struct ReviewOptions {
     pub max_prs_per_file: usize,
     pub pr_scan_limit: usize,
     pub parallelism: usize,
+    pub check_timeout_secs: u64,
     pub keep_worktree: bool,
 }
 
@@ -111,7 +115,7 @@ pub async fn run_review(
             progress.clone(),
         )
         .await?;
-        aggregate_final_report(
+        let mut report = aggregate_final_report(
             &options,
             &pr,
             &worktree,
@@ -119,7 +123,27 @@ pub async fn run_review(
             provider.clone(),
             progress.clone(),
         )
-        .await
+        .await?;
+        let check_plan = plan_checks(
+            &options,
+            &pr,
+            &worktree,
+            &report,
+            provider.clone(),
+            progress.clone(),
+        )
+        .await?;
+        let checks = run_checks(
+            &options,
+            &worktree,
+            &check_plan,
+            run_logger.clone(),
+            progress.clone(),
+        )
+        .await?;
+        report.checks_summary = summarize_checks(&check_plan.summary, &checks);
+        report.checks = checks;
+        Ok(report)
     }
     .await;
 
@@ -237,7 +261,7 @@ async fn review_files(
     provider: Arc<dyn Provider>,
     progress: Arc<ProgressReporter>,
 ) -> Result<Vec<FileAggregate>> {
-    let total_invocations = jobs.iter().map(planned_invocations_for_job).sum::<usize>() + 1;
+    let total_invocations = jobs.iter().map(planned_invocations_for_job).sum::<usize>() + 2;
     progress.set_agent_total(total_invocations);
     let queue_step = progress.begin_step(
         "phase",
@@ -378,7 +402,7 @@ async fn aggregate_final_report(
     aggregates.sort_by(|left, right| left.file.cmp(&right.file));
 
     let prompt = build_final_report_prompt(options, pr, &aggregates, worktree);
-    let mut report: FinalReviewReport = invoke_typed(
+    let draft: FinalReviewDraft = invoke_typed(
         provider.as_ref(),
         &worktree.path,
         &format!("aggregate pr {}", pr.number),
@@ -386,19 +410,224 @@ async fn aggregate_final_report(
     )
     .await?;
 
-    sort_findings(&mut report.ranked_findings);
-    report.per_file = aggregates;
-    report.provider = provider.kind().as_str().to_string();
-    report.repo = options.repo_name.clone();
-    report.pr_number = pr.number;
-    report.pr_title = pr.title.clone();
-    report.worktree_path = worktree.path.display().to_string();
+    let mut ranked_findings = draft.ranked_findings;
+    sort_findings(&mut ranked_findings);
+    let file_count = aggregates.len();
+    let findings_count = ranked_findings.len();
+    let report = FinalReviewReport {
+        repo: options.repo_name.clone(),
+        pr_number: pr.number,
+        pr_title: pr.title.clone(),
+        provider: provider.kind().as_str().to_string(),
+        worktree_path: worktree.path.display().to_string(),
+        run_artifact_dir: String::new(),
+        executive_summary: draft.executive_summary,
+        checks_summary: String::new(),
+        ranked_findings,
+        per_file: aggregates,
+        checks: Vec::new(),
+        notes: draft.notes,
+    };
     step.done(format!(
         "{} ranked findings across {} files",
-        report.ranked_findings.len(),
-        report.per_file.len()
+        findings_count, file_count
     ));
     Ok(report)
+}
+
+async fn plan_checks(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+    report: &FinalReviewReport,
+    provider: Arc<dyn Provider>,
+    progress: Arc<ProgressReporter>,
+) -> Result<CheckPlanDraft> {
+    let step = progress.begin_step("phase", "planning checks".to_string());
+    let prompt = build_check_plan_prompt(options, pr, report, worktree);
+    let plan_result: Result<CheckPlanDraft> = async {
+        let plan: CheckPlanDraft = invoke_typed(
+            provider.as_ref(),
+            &worktree.path,
+            &format!("plan checks {}", pr.number),
+            &prompt,
+        )
+        .await?;
+        validate_check_plan(&plan)?;
+        Ok(plan)
+    }
+    .await;
+
+    match plan_result {
+        Ok(plan) => {
+            step.done(format!("{} checks planned", plan.checks.len()));
+            Ok(plan)
+        }
+        Err(error) => {
+            step.fail(error.to_string());
+            Err(error)
+        }
+    }
+}
+
+async fn run_checks(
+    options: &ReviewOptions,
+    worktree: &Worktree,
+    plan: &CheckPlanDraft,
+    run_logger: Arc<RunLogger>,
+    progress: Arc<ProgressReporter>,
+) -> Result<Vec<CheckExecution>> {
+    let step = progress.begin_step(
+        "phase",
+        format!("running {} checks sequentially", plan.checks.len()),
+    );
+    let total = plan.checks.len();
+    let mut executions = Vec::with_capacity(total);
+
+    for (index, check) in plan.checks.iter().enumerate() {
+        let label = format!("[{}/{}] {}", index + 1, total, check.name);
+        let check_step = progress.begin_step("check", label);
+        let invocation = run_logger.begin(&format!("check {} {}", index + 1, check.name));
+        let command_body = format!(
+            "index: {}\nname: {}\ncommand: {}\nrationale: {}\nexpected_signal: {}\nrelated_findings: {}\ncwd: {}\n",
+            index + 1,
+            check.name,
+            check.command,
+            check.rationale,
+            check.expected_signal,
+            check.related_findings.join(" | "),
+            worktree.path.display()
+        );
+        run_logger
+            .write_text(&invocation, "check-command", &command_body)
+            .await?;
+
+        let started_at = Instant::now();
+        let args = vec!["-lc".to_string(), check.command.clone()];
+        let output = capture_command_with_input(
+            "bash",
+            &args,
+            &worktree.path,
+            None,
+            options.check_timeout_secs,
+        )
+        .await;
+        let duration_secs = started_at.elapsed().as_secs_f32();
+
+        let execution = match output {
+            Ok(output) => {
+                let status = if output.success { "passed" } else { "failed" };
+                let result_body = format!(
+                    "index: {}\nname: {}\ncommand: {}\nstatus: {}\nexit_code: {:?}\nduration_secs: {:.2}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+                    index + 1,
+                    check.name,
+                    check.command,
+                    status,
+                    output.status_code,
+                    duration_secs,
+                    excerpt(&output.stdout, 12000),
+                    excerpt(&output.stderr, 12000)
+                );
+                run_logger
+                    .write_text(&invocation, "check-result", &result_body)
+                    .await?;
+
+                if output.success {
+                    check_step.done(format!("passed in {:.1}s", duration_secs));
+                } else {
+                    check_step.fail(format!(
+                        "failed with exit code {:?} in {:.1}s",
+                        output.status_code, duration_secs
+                    ));
+                }
+
+                CheckExecution {
+                    index: index + 1,
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    rationale: check.rationale.clone(),
+                    expected_signal: check.expected_signal.clone(),
+                    related_findings: check.related_findings.clone(),
+                    status: status.to_string(),
+                    exit_code: output.status_code,
+                    duration_secs,
+                    stdout_excerpt: excerpt(&output.stdout, 4000),
+                    stderr_excerpt: excerpt(&output.stderr, 4000),
+                }
+            }
+            Err(error) => {
+                let result_body = format!(
+                    "index: {}\nname: {}\ncommand: {}\nstatus: error\nduration_secs: {:.2}\n\nerror:\n{}\n",
+                    index + 1,
+                    check.name,
+                    check.command,
+                    duration_secs,
+                    error
+                );
+                run_logger
+                    .write_text(&invocation, "check-result", &result_body)
+                    .await?;
+                check_step.fail(format!("error after {:.1}s -> {}", duration_secs, error));
+
+                CheckExecution {
+                    index: index + 1,
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    rationale: check.rationale.clone(),
+                    expected_signal: check.expected_signal.clone(),
+                    related_findings: check.related_findings.clone(),
+                    status: "error".to_string(),
+                    exit_code: None,
+                    duration_secs,
+                    stdout_excerpt: String::new(),
+                    stderr_excerpt: excerpt(&error.to_string(), 4000),
+                }
+            }
+        };
+
+        executions.push(execution);
+    }
+
+    let passed = executions
+        .iter()
+        .filter(|check| check.status == "passed")
+        .count();
+    let failed = executions
+        .iter()
+        .filter(|check| check.status == "failed")
+        .count();
+    let errored = executions
+        .iter()
+        .filter(|check| check.status == "error")
+        .count();
+    step.done(format!(
+        "{} passed, {} failed, {} errored",
+        passed, failed, errored
+    ));
+    Ok(executions)
+}
+
+fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
+    anyhow::ensure!(
+        plan.checks.len() >= 5,
+        "check plan returned {} checks; expected at least 5",
+        plan.checks.len()
+    );
+
+    for (index, check) in plan.checks.iter().enumerate() {
+        anyhow::ensure!(
+            !check.name.trim().is_empty(),
+            "check {} is missing a name",
+            index + 1
+        );
+        anyhow::ensure!(
+            !check.command.trim().is_empty(),
+            "check {} is missing a command",
+            index + 1
+        );
+    }
+
+    Ok(())
 }
 
 async fn invoke_with_semaphore<T>(
@@ -571,6 +800,64 @@ fn build_final_report_prompt(
     )
 }
 
+fn build_check_plan_prompt(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    report: &FinalReviewReport,
+    worktree: &Worktree,
+) -> String {
+    let changed_files = pr
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "- {} (+{} / -{})",
+                file.path, file.additions, file.deletions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let changed_test_files = pr
+        .files
+        .iter()
+        .filter(|file| looks_like_test_file(&file.path))
+        .map(|file| format!("- {}", file.path))
+        .collect::<Vec<_>>();
+    let changed_test_files = if changed_test_files.is_empty() {
+        "- none".to_string()
+    } else {
+        changed_test_files.join("\n")
+    };
+
+    format!(
+        "You are planning a post-review checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         Worktree path: {worktree}\n\
+         Base branch: {base}\n\n\
+         Changed files:\n{changed_files}\n\n\
+         Changed test-like files:\n{changed_test_files}\n\n\
+         Ranked findings:\n{findings}\n\n\
+         Per-file summaries:\n{per_file}\n\n\
+         Requirements:\n\
+         - Return at least 5 checks.\n\
+         - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
+         - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
+         - Use repo-specific guidance from the global reviewer instructions when available, especially for build/test commands.\n\
+         - Prefer targeted checks first, then broader build/test or lint validation where useful.\n\
+         - Avoid duplicate commands.\n\
+         - Every check must include a clear rationale and the expected signal to inspect.\n\
+         - Related findings should cite finding titles or file paths, not vague references.",
+        pr_number = pr.number,
+        pr_title = pr.title,
+        repo = options.repo_name,
+        worktree = worktree.path.display(),
+        base = pr.base_ref_name,
+        changed_files = changed_files,
+        changed_test_files = changed_test_files,
+        findings = serde_json::to_string_pretty(&report.ranked_findings).unwrap_or_default(),
+        per_file = serde_json::to_string_pretty(&report.per_file).unwrap_or_default()
+    )
+}
+
 pub fn render_markdown(report: &FinalReviewReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -611,6 +898,51 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
                     "   References: {}\n",
                     finding.source_refs.join(", ")
                 ));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str("## Checks\n\n");
+    out.push_str(report.checks_summary.trim());
+    out.push_str("\n\n");
+    if report.checks.is_empty() {
+        out.push_str("No checks were executed.\n\n");
+    } else {
+        for check in &report.checks {
+            out.push_str(&format!(
+                "{}. [{}] {}\n",
+                check.index,
+                check.status.to_ascii_uppercase(),
+                check.name
+            ));
+            out.push_str(&format!("   Command: `{}`\n", check.command));
+            out.push_str(&format!("   Rationale: {}\n", check.rationale.trim()));
+            out.push_str(&format!(
+                "   Expected signal: {}\n",
+                check.expected_signal.trim()
+            ));
+            out.push_str(&format!(
+                "   Exit code: {:?}, duration: {:.1}s\n",
+                check.exit_code, check.duration_secs
+            ));
+            if !check.related_findings.is_empty() {
+                out.push_str(&format!(
+                    "   Related findings: {}\n",
+                    check.related_findings.join(", ")
+                ));
+            }
+            if !check.stdout_excerpt.trim().is_empty() {
+                out.push_str("   Stdout excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(check.stdout_excerpt.trim());
+                out.push_str("\n```\n");
+            }
+            if !check.stderr_excerpt.trim().is_empty() {
+                out.push_str("   Stderr excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(check.stderr_excerpt.trim());
+                out.push_str("\n```\n");
             }
             out.push('\n');
         }
@@ -671,4 +1003,42 @@ fn short_sha(sha: &str) -> &str {
 
 fn planned_invocations_for_job(job: &FileReviewJob) -> usize {
     2 + job.recent_commits.len() + job.recent_prs.len()
+}
+
+fn summarize_checks(plan_summary: &str, checks: &[CheckExecution]) -> String {
+    let passed = checks
+        .iter()
+        .filter(|check| check.status == "passed")
+        .count();
+    let failed = checks
+        .iter()
+        .filter(|check| check.status == "failed")
+        .count();
+    let errored = checks
+        .iter()
+        .filter(|check| check.status == "error")
+        .count();
+
+    format!(
+        "{}\n\nExecuted {} checks: {} passed, {} failed, {} errored.",
+        plan_summary.trim(),
+        checks.len(),
+        passed,
+        failed,
+        errored
+    )
+}
+
+fn looks_like_test_file(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.contains("/test")
+        || lowered.contains("/tests/")
+        || lowered.contains("__tests__")
+        || lowered.contains("spec")
+        || lowered.ends_with("_test.py")
+        || lowered.ends_with("_test.rs")
+        || lowered.ends_with(".spec.ts")
+        || lowered.ends_with(".spec.js")
+        || lowered.ends_with(".test.ts")
+        || lowered.ends_with(".test.js")
 }

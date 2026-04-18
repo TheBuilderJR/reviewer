@@ -72,6 +72,9 @@ struct Args {
     #[arg(long, default_value_t = 600)]
     agent_timeout_secs: u64,
 
+    #[arg(long, default_value_t = 1800)]
+    check_timeout_secs: u64,
+
     #[arg(long)]
     keep_worktree: bool,
 
@@ -154,6 +157,7 @@ async fn main() -> Result<()> {
         max_prs_per_file: args.max_prs_per_file,
         pr_scan_limit: args.pr_scan_limit,
         parallelism: args.parallelism.max(1),
+        check_timeout_secs: args.check_timeout_secs,
         keep_worktree: args.keep_worktree,
     };
 

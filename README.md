@@ -18,6 +18,7 @@ For a GitHub PR, the harness:
 5. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
 6. If `~/.reviewer.md` exists, prepends it to every model prompt as shared reviewer guidance.
 7. Streams live progress to stderr for major phases and per-agent start/finish status.
+8. Adds a final `checks` phase that plans at least 5 sanity checks, then executes them sequentially in the PR worktree.
 
 The harness assumes the selected CLI is already authenticated.
 
@@ -70,6 +71,7 @@ Optional controls:
 - `--pr-scan-limit <n>`
 - `--parallelism <n>`
 - `--agent-timeout-secs <n>`
+- `--check-timeout-secs <n>` to control the timeout for each sequential shell check
 - `--keep-worktree`
 
 ## Releases
@@ -82,8 +84,9 @@ Optional controls:
 
 - The current implementation gathers prior PR context by scanning recent merged PRs and filtering to file matches. That is intentionally simple and may be slow on large repos.
 - Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
-- The current build step is only advisory in progress output; the harness does not yet execute a repo build command.
+- The current build step is only advisory in progress output; actual build/test execution happens through the final `checks` phase.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
+- Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.
 - Those artifact files now include the exact provider argv as JSON, so extra flags like `--dangerously-skip-permissions` are visible after the fact.
 - `~/.reviewer.md` is optional. If present, its contents are injected into every provider prompt, which is the right place for stable instructions like build/test commands, repo-specific invariants, or review priorities.

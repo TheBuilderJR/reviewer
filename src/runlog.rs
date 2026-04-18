@@ -106,6 +106,15 @@ impl RunLogger {
         self.write_stage(invocation, "response", &body).await
     }
 
+    pub async fn write_text(
+        &self,
+        invocation: &InvocationLog,
+        run_type: &str,
+        body: &str,
+    ) -> Result<PathBuf> {
+        self.write_stage(invocation, run_type, body).await
+    }
+
     async fn write_stage(
         &self,
         invocation: &InvocationLog,

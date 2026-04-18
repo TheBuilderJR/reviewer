@@ -91,6 +91,43 @@ pub struct FileAggregate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FinalReviewDraft {
+    pub executive_summary: String,
+    pub ranked_findings: Vec<ReviewFinding>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckSpec {
+    pub name: String,
+    pub command: String,
+    pub rationale: String,
+    pub expected_signal: String,
+    pub related_findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckPlanDraft {
+    pub summary: String,
+    pub checks: Vec<CheckSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckExecution {
+    pub index: usize,
+    pub name: String,
+    pub command: String,
+    pub rationale: String,
+    pub expected_signal: String,
+    pub related_findings: Vec<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub duration_secs: f32,
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FinalReviewReport {
     pub repo: String,
     pub pr_number: u64,
@@ -99,8 +136,10 @@ pub struct FinalReviewReport {
     pub worktree_path: String,
     pub run_artifact_dir: String,
     pub executive_summary: String,
+    pub checks_summary: String,
     pub ranked_findings: Vec<ReviewFinding>,
     pub per_file: Vec<FileAggregate>,
+    pub checks: Vec<CheckExecution>,
     pub notes: Vec<String>,
 }
 
