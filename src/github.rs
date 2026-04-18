@@ -6,8 +6,6 @@ use serde::Deserialize;
 use crate::shell::run_command;
 use crate::types::{ChangedFile, PullRequestDetails};
 
-const GH_TIMEOUT_SECS: u64 = 120;
-
 #[derive(Debug, Deserialize)]
 struct GhRepoView {
     #[serde(rename = "nameWithOwner")]
@@ -43,7 +41,7 @@ pub async fn resolve_repo_name(repo_path: &Path) -> Result<String> {
         "--json".to_string(),
         "nameWithOwner".to_string(),
     ];
-    let output = run_command("gh", &args, repo_path, GH_TIMEOUT_SECS)
+    let output = run_command("gh", &args, repo_path)
         .await
         .context("failed to resolve GitHub repo via gh")?;
     let value: GhRepoView =
@@ -71,7 +69,7 @@ pub async fn ensure_repo_checkout(repo: &str, target_dir: &Path) -> Result<PathB
         "--".to_string(),
         "--filter=blob:none".to_string(),
     ];
-    run_command("gh", &args, parent, GH_TIMEOUT_SECS)
+    run_command("gh", &args, parent)
         .await
         .with_context(|| format!("failed to clone {repo} into {}", target_dir.display()))?;
 
@@ -93,7 +91,7 @@ pub async fn fetch_pr_details(
         "number,title,url,body,baseRefName,headRefName,headRefOid,files".to_string(),
     ];
 
-    let output = run_command("gh", &args, repo_path, GH_TIMEOUT_SECS)
+    let output = run_command("gh", &args, repo_path)
         .await
         .with_context(|| format!("failed to fetch PR #{pr_number}"))?;
 

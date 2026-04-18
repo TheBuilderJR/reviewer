@@ -63,8 +63,6 @@ Optional controls:
 - `--model <name>` to pass a provider-specific model name through to the CLI
 - `--extra-args "<shell-style flags>"` to pass provider-specific flags straight through to `codex` or `claude`
 - `--parallelism <n>`
-- `--agent-timeout-secs <n>`
-- `--check-timeout-secs <n>` to control the timeout for each sequential shell check
 - `--keep-worktree`
 
 ## Releases
@@ -76,6 +74,7 @@ Optional controls:
 ## Notes
 
 - Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
+- The harness does not impose subprocess timeouts. `git`, `gh`, provider invocations, and sequential checks all run until they exit on their own.
 - `~/.reviewer.md` still matters everywhere: the build agent, every file reviewer, the checks planner, and the final review writer all see that shared guidance.
 - The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in the final Markdown.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.

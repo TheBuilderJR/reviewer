@@ -64,12 +64,6 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     parallelism: usize,
 
-    #[arg(long, default_value_t = 600)]
-    agent_timeout_secs: u64,
-
-    #[arg(long, default_value_t = 1800)]
-    check_timeout_secs: u64,
-
     #[arg(long)]
     keep_worktree: bool,
 
@@ -125,7 +119,6 @@ async fn main() -> Result<()> {
     let provider = build_provider(
         args.provider.into(),
         args.model.clone(),
-        args.agent_timeout_secs,
         run_logger.clone(),
         progress.clone(),
         Some(prompt_preamble),
@@ -143,7 +136,6 @@ async fn main() -> Result<()> {
         repo_path,
         user_request: None,
         parallelism: args.parallelism.max(1),
-        check_timeout_secs: args.check_timeout_secs,
         keep_worktree: args.keep_worktree,
     };
 

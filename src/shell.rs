@@ -1,11 +1,9 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -15,13 +13,8 @@ pub struct CmdOutput {
     pub success: bool,
 }
 
-pub async fn run_command(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    timeout_secs: u64,
-) -> Result<CmdOutput> {
-    run_command_with_input(program, args, cwd, None, timeout_secs).await
+pub async fn run_command(program: &str, args: &[String], cwd: &Path) -> Result<CmdOutput> {
+    run_command_with_input(program, args, cwd, None).await
 }
 
 pub async fn run_command_with_input(
@@ -29,9 +22,8 @@ pub async fn run_command_with_input(
     args: &[String],
     cwd: &Path,
     stdin_text: Option<&str>,
-    timeout_secs: u64,
 ) -> Result<CmdOutput> {
-    let output = capture_command_with_input(program, args, cwd, stdin_text, timeout_secs).await?;
+    let output = capture_command_with_input(program, args, cwd, stdin_text).await?;
 
     if !output.success {
         bail!(
@@ -50,7 +42,6 @@ pub async fn capture_command_with_input(
     args: &[String],
     cwd: &Path,
     stdin_text: Option<&str>,
-    timeout_secs: u64,
 ) -> Result<CmdOutput> {
     let mut command = Command::new(program);
     command
@@ -83,9 +74,9 @@ pub async fn capture_command_with_input(
             .with_context(|| format!("failed closing stdin for {program}"))?;
     }
 
-    let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+    let output = child
+        .wait_with_output()
         .await
-        .with_context(|| format!("{program} timed out after {timeout_secs}s"))?
         .with_context(|| format!("failed waiting for {program}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

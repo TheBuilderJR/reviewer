@@ -5,8 +5,6 @@ use anyhow::{Context, Result};
 
 use crate::shell::run_command;
 
-const GIT_TIMEOUT_SECS: u64 = 120;
-
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub path: PathBuf,
@@ -20,12 +18,7 @@ pub async fn fetch_pr_head_ref(repo_path: &Path, pr_number: u64) -> Result<Strin
         "origin".to_string(),
         format!("refs/pull/{pr_number}/head:{review_ref}"),
     ];
-    run_command(
-        "git",
-        &prefix(repo_path, fetch_base),
-        repo_path,
-        GIT_TIMEOUT_SECS,
-    )
+    run_command("git", &prefix(repo_path, fetch_base), repo_path)
     .await
     .with_context(|| format!("failed fetching PR #{pr_number}"))?;
 
@@ -39,9 +32,7 @@ pub async fn is_git_repo(repo_path: &Path) -> bool {
         "rev-parse".to_string(),
         "--is-inside-work-tree".to_string(),
     ];
-    run_command("git", &args, repo_path, GIT_TIMEOUT_SECS)
-        .await
-        .is_ok()
+    run_command("git", &args, repo_path).await.is_ok()
 }
 
 pub async fn create_pr_worktree(
@@ -62,12 +53,7 @@ pub async fn create_pr_worktree(
         worktree_path.display().to_string(),
         review_ref.to_string(),
     ];
-    run_command(
-        "git",
-        &prefix(repo_path, add_args),
-        repo_path,
-        GIT_TIMEOUT_SECS,
-    )
+    run_command("git", &prefix(repo_path, add_args), repo_path)
     .await
     .context("failed creating worktree")?;
 
@@ -84,12 +70,7 @@ pub async fn cleanup_worktree(repo_path: &Path, worktree: &Worktree) -> Result<(
         "--force".to_string(),
         worktree.path.display().to_string(),
     ];
-    run_command(
-        "git",
-        &prefix(repo_path, remove_args),
-        repo_path,
-        GIT_TIMEOUT_SECS,
-    )
+    run_command("git", &prefix(repo_path, remove_args), repo_path)
     .await
     .context("failed removing worktree")?;
 
@@ -98,13 +79,7 @@ pub async fn cleanup_worktree(repo_path: &Path, worktree: &Worktree) -> Result<(
         "-d".to_string(),
         worktree.review_ref.clone(),
     ];
-    let _ = run_command(
-        "git",
-        &prefix(repo_path, update_ref_args),
-        repo_path,
-        GIT_TIMEOUT_SECS,
-    )
-    .await;
+    let _ = run_command("git", &prefix(repo_path, update_ref_args), repo_path).await;
     Ok(())
 }
 
@@ -114,7 +89,7 @@ pub async fn fetch_base_branch(repo_path: &Path, base_ref: &str) -> Result<()> {
         "origin".to_string(),
         base_ref.to_string(),
     ];
-    run_command("git", &prefix(repo_path, args), repo_path, GIT_TIMEOUT_SECS)
+    run_command("git", &prefix(repo_path, args), repo_path)
         .await
         .with_context(|| format!("failed fetching base branch {base_ref}"))?;
     Ok(())
@@ -130,9 +105,7 @@ pub async fn diff_for_file(worktree_path: &Path, base_ref: &str, file: &str) -> 
         "--".to_string(),
         file.to_string(),
     ];
-    Ok(run_command("git", &args, worktree_path, GIT_TIMEOUT_SECS)
-        .await?
-        .stdout)
+    Ok(run_command("git", &args, worktree_path).await?.stdout)
 }
 
 fn prefix(repo_path: &Path, args: Vec<String>) -> Vec<String> {

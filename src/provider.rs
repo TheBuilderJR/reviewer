@@ -43,7 +43,6 @@ pub struct PromptPreamble {
 pub fn build_provider(
     kind: ProviderKind,
     model: Option<String>,
-    timeout_secs: u64,
     run_logger: Arc<RunLogger>,
     progress: Arc<ProgressReporter>,
     prompt_preamble: Option<PromptPreamble>,
@@ -52,7 +51,6 @@ pub fn build_provider(
     match kind {
         ProviderKind::Codex => Arc::new(CodexProvider {
             model,
-            timeout_secs,
             run_logger,
             progress,
             prompt_preamble,
@@ -60,7 +58,6 @@ pub fn build_provider(
         }),
         ProviderKind::Claude => Arc::new(ClaudeProvider {
             model,
-            timeout_secs,
             run_logger,
             progress,
             prompt_preamble,
@@ -90,7 +87,6 @@ where
 
 struct CodexProvider {
     model: Option<String>,
-    timeout_secs: u64,
     run_logger: Arc<RunLogger>,
     progress: Arc<ProgressReporter>,
     prompt_preamble: Option<PromptPreamble>,
@@ -147,10 +143,9 @@ impl Provider for CodexProvider {
             .progress
             .begin_agent(render_agent_label(label, &prompt_path));
 
-        let output =
-            capture_command_with_input("codex", &args, cwd, Some(&prompt), self.timeout_secs)
-                .await
-                .context("codex invocation failed")?;
+        let output = capture_command_with_input("codex", &args, cwd, Some(&prompt))
+            .await
+            .context("codex invocation failed")?;
 
         let body = tokio::fs::read_to_string(&output_path)
             .await
@@ -219,7 +214,6 @@ impl Provider for CodexProvider {
 
 struct ClaudeProvider {
     model: Option<String>,
-    timeout_secs: u64,
     run_logger: Arc<RunLogger>,
     progress: Arc<ProgressReporter>,
     prompt_preamble: Option<PromptPreamble>,
@@ -273,10 +267,9 @@ impl Provider for ClaudeProvider {
             .progress
             .begin_agent(render_agent_label(label, &prompt_path));
 
-        let output =
-            capture_command_with_input("claude", &args, cwd, Some(&prompt), self.timeout_secs)
-                .await
-                .context("claude invocation failed")?;
+        let output = capture_command_with_input("claude", &args, cwd, Some(&prompt))
+            .await
+            .context("claude invocation failed")?;
 
         let mut parsed = None::<Value>;
         let mut error = None::<String>;
@@ -545,11 +538,11 @@ mod tests {
 #[allow(dead_code)]
 pub async fn check_codex_login(cwd: &Path) -> Result<String> {
     let args = vec!["login".to_string(), "status".to_string()];
-    Ok(run_command("codex", &args, cwd, 30).await?.stdout)
+    Ok(run_command("codex", &args, cwd).await?.stdout)
 }
 
 #[allow(dead_code)]
 pub async fn check_claude_login(cwd: &Path) -> Result<String> {
     let args = vec!["auth".to_string(), "status".to_string()];
-    Ok(run_command("claude", &args, cwd, 30).await?.stdout)
+    Ok(run_command("claude", &args, cwd).await?.stdout)
 }

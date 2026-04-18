@@ -28,7 +28,6 @@ pub struct ReviewOptions {
     pub repo_path: PathBuf,
     pub user_request: Option<String>,
     pub parallelism: usize,
-    pub check_timeout_secs: u64,
     pub keep_worktree: bool,
 }
 
@@ -381,7 +380,7 @@ async fn plan_checks(
 }
 
 async fn run_checks(
-    options: &ReviewOptions,
+    _options: &ReviewOptions,
     worktree: &Worktree,
     plan: &CheckPlanDraft,
     run_logger: Arc<RunLogger>,
@@ -414,14 +413,7 @@ async fn run_checks(
 
         let started_at = Instant::now();
         let args = vec!["-lc".to_string(), check.command.clone()];
-        let output = capture_command_with_input(
-            "bash",
-            &args,
-            &worktree.path,
-            None,
-            options.check_timeout_secs,
-        )
-        .await;
+        let output = capture_command_with_input("bash", &args, &worktree.path, None).await;
         let duration_secs = started_at.elapsed().as_secs_f32();
 
         let execution = match output {
