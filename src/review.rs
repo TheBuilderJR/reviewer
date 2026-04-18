@@ -16,8 +16,9 @@ use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
 use crate::shell::capture_command_with_input;
 use crate::types::{
-    CheckExecution, CheckPlanDraft, FileReviewDraft, FileReviewJob, FinalReviewDraft,
-    FinalReviewReport, InlineComment, PullRequestDetails, sort_findings, sort_inline_comments,
+    BuildExecution, CheckExecution, CheckPlanDraft, FileReviewDraft, FileReviewJob,
+    FinalReviewDraft, FinalReviewReport, InlineComment, PullRequestDetails, sort_findings,
+    sort_inline_comments,
 };
 
 #[derive(Debug, Clone)]
@@ -97,6 +98,10 @@ pub async fn run_review(
     };
 
     let mut run_result = async {
+        progress.set_agent_total(1);
+        let build =
+            execute_build_phase(&options, &pr, &worktree, provider.clone(), progress.clone())
+                .await?;
         let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
         progress.set_agent_total(jobs.len() + 2);
         let file_reviews = review_files(
@@ -112,6 +117,7 @@ pub async fn run_review(
             &options,
             &pr,
             &worktree,
+            &build,
             &file_reviews,
             provider.clone(),
             progress.clone(),
@@ -130,6 +136,7 @@ pub async fn run_review(
             &options,
             &pr,
             &worktree,
+            &build,
             file_reviews,
             checks,
             checks_summary,
@@ -170,6 +177,53 @@ pub async fn run_review(
     }
 
     run_result
+}
+
+async fn execute_build_phase(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+    provider: Arc<dyn Provider>,
+    progress: Arc<ProgressReporter>,
+) -> Result<BuildExecution> {
+    let step = progress.begin_step("phase", "building repo".to_string());
+    let prompt = build_repo_prompt(options, pr, worktree);
+    let build_result: Result<BuildExecution> = async {
+        let mut result: BuildExecution = invoke_typed(
+            provider.as_ref(),
+            &worktree.path,
+            &format!("build repo {}", pr.number),
+            &prompt,
+        )
+        .await?;
+        normalize_build_execution(&mut result);
+        validate_build_execution(&result)?;
+        Ok(result)
+    }
+    .await;
+
+    match build_result {
+        Ok(result) => {
+            let detail = match result.commands_run.is_empty() {
+                true => format!("{}: {}", result.status, result.summary),
+                false => format!(
+                    "{}: {} ({} commands)",
+                    result.status,
+                    result.summary,
+                    result.commands_run.len()
+                ),
+            };
+            match result.status.as_str() {
+                "passed" | "skipped" => step.done(detail),
+                _ => step.fail(detail),
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            step.fail(error.to_string());
+            Err(error)
+        }
+    }
 }
 
 async fn prepare_file_jobs(
@@ -294,12 +348,13 @@ async fn plan_checks(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     worktree: &Worktree,
+    build: &BuildExecution,
     file_reviews: &[FileReviewDraft],
     provider: Arc<dyn Provider>,
     progress: Arc<ProgressReporter>,
 ) -> Result<CheckPlanDraft> {
     let step = progress.begin_step("phase", "planning checks".to_string());
-    let prompt = build_check_plan_prompt(options, pr, file_reviews, worktree);
+    let prompt = build_check_plan_prompt(options, pr, build, file_reviews, worktree);
     let plan_result: Result<CheckPlanDraft> = async {
         let plan: CheckPlanDraft = invoke_typed(
             provider.as_ref(),
@@ -466,6 +521,7 @@ async fn write_final_review(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     worktree: &Worktree,
+    build: &BuildExecution,
     mut file_reviews: Vec<FileReviewDraft>,
     checks: Vec<CheckExecution>,
     checks_summary: String,
@@ -483,7 +539,7 @@ async fn write_final_review(
     }
     file_reviews.sort_by(|left, right| left.file.cmp(&right.file));
 
-    let prompt = build_final_review_prompt(options, pr, &file_reviews, &checks, worktree);
+    let prompt = build_final_review_prompt(options, pr, build, &file_reviews, &checks, worktree);
     let draft_result: Result<FinalReviewDraft> = async {
         let mut draft: FinalReviewDraft = invoke_typed(
             provider.as_ref(),
@@ -514,6 +570,7 @@ async fn write_final_review(
                 worktree_path: worktree.path.display().to_string(),
                 run_artifact_dir: String::new(),
                 executive_summary: draft.executive_summary,
+                build: Some(build.clone()),
                 summary_findings,
                 inline_comments,
                 checks_summary,
@@ -574,6 +631,26 @@ fn validate_file_review(job: &FileReviewJob, review: &FileReviewDraft) -> Result
     Ok(())
 }
 
+fn validate_build_execution(result: &BuildExecution) -> Result<()> {
+    anyhow::ensure!(
+        matches!(result.status.as_str(), "passed" | "failed" | "skipped"),
+        "build phase returned unsupported status `{}`",
+        result.status
+    );
+    anyhow::ensure!(
+        !result.summary.trim().is_empty(),
+        "build phase returned an empty summary"
+    );
+    if result.status != "skipped" {
+        anyhow::ensure!(
+            !result.commands_run.is_empty(),
+            "build phase must report at least one command when status is {}",
+            result.status
+        );
+    }
+    Ok(())
+}
+
 fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
     anyhow::ensure!(
         plan.checks.len() >= 5,
@@ -625,6 +702,27 @@ fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_build_execution(result: &mut BuildExecution) {
+    if !matches!(result.status.as_str(), "passed" | "failed" | "skipped") {
+        result.status = if result.commands_run.is_empty() {
+            "skipped".to_string()
+        } else {
+            "failed".to_string()
+        };
+    }
+
+    if result.summary.trim().is_empty() {
+        result.summary = fallback_build_summary(&result.status, result.commands_run.len());
+    }
+
+    if result.status != "skipped" && result.commands_run.is_empty() {
+        result.commands_run.push(
+            "Build agent did not report exact commands; inspect the transcript artifact."
+                .to_string(),
+        );
+    }
 }
 
 fn normalize_file_review(job: &FileReviewJob, review: &mut FileReviewDraft) {
@@ -737,6 +835,17 @@ fn fallback_final_summary(findings: usize, comments: usize) -> String {
     }
 }
 
+fn fallback_build_summary(status: &str, command_count: usize) -> String {
+    match status {
+        "passed" => format!("Build/setup completed successfully after {command_count} command(s)."),
+        "failed" => format!(
+            "Build/setup failed after {command_count} command(s); inspect the transcript for details."
+        ),
+        _ => "Build/setup was skipped because the agent could not find executable instructions."
+            .to_string(),
+    }
+}
+
 fn first_nonempty_line(value: &str) -> Option<String> {
     value
         .lines()
@@ -801,9 +910,59 @@ fn build_file_review_prompt(
     )
 }
 
+fn build_repo_prompt(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+) -> String {
+    let changed_files = pr
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "- {} (+{} / -{})",
+                file.path, file.additions, file.deletions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are the repo build phase agent for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         Worktree path: {worktree}\n\
+         Base branch: {base}\n\
+         PR URL: {pr_url}\n\n\
+         User request:\n{user_request}\n\n\
+         Changed files:\n{changed_files}\n\n\
+         Task:\n\
+         - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built, prepared, or bootstrapped.\n\
+         - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
+         - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
+         - Keep the run non-interactive.\n\
+         - If the build fails, stop after enough investigation to explain the blocker clearly.\n\
+         - If there is genuinely no usable build guidance in the reviewer instructions, return status `skipped` with a concrete explanation.\n\n\
+         Return requirements:\n\
+         - Return a compact JSON object with keys: `status`, `summary`, `commands_run`, `stdout_excerpt`, `stderr_excerpt`, `notes`.\n\
+         - `status` must be one of: passed, failed, skipped.\n\
+         - `commands_run` must contain the exact shell commands you actually executed, in order.\n\
+         - `summary` should be a short plain-English result.\n\
+         - `stdout_excerpt` and `stderr_excerpt` should contain only the most relevant output excerpts.\n\
+         - Omit fields you do not need instead of filling them with noise.",
+        pr_number = pr.number,
+        pr_title = pr.title,
+        repo = options.repo_name,
+        worktree = worktree.path.display(),
+        base = pr.base_ref_name,
+        pr_url = pr.url,
+        user_request = render_user_request(options.user_request.as_deref()),
+        changed_files = changed_files
+    )
+}
+
 fn build_check_plan_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
+    build: &BuildExecution,
     file_reviews: &[FileReviewDraft],
     worktree: &Worktree,
 ) -> String {
@@ -837,13 +996,14 @@ fn build_check_plan_prompt(
          User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Changed test-like files:\n{changed_test_files}\n\n\
+         Build phase result:\n{build}\n\n\
          Per-file review results:\n{file_reviews}\n\n\
          Requirements:\n\
          - Return a compact JSON object with keys: `summary` and `checks`.\n\
          - Return at least 5 checks.\n\
          - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
-         - Use repo-specific guidance from the global reviewer instructions when available, especially for build/test commands.\n\
+         - Use the build phase result plus repo-specific guidance from the global reviewer instructions when choosing commands.\n\
          - Prefer targeted checks first, then broader validation where useful.\n\
          - Avoid duplicate commands.\n\
          - Every check should include a clear rationale and expected signal, but those fields can be brief.\n\
@@ -856,6 +1016,7 @@ fn build_check_plan_prompt(
         user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files,
         changed_test_files = changed_test_files,
+        build = serde_json::to_string_pretty(build).unwrap_or_default(),
         file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default()
     )
 }
@@ -863,6 +1024,7 @@ fn build_check_plan_prompt(
 fn build_final_review_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
+    build: &BuildExecution,
     file_reviews: &[FileReviewDraft],
     checks: &[CheckExecution],
     worktree: &Worktree,
@@ -875,6 +1037,7 @@ fn build_final_review_prompt(
          Worktree: {worktree}\n\
          Provider: {provider}\n\n\
          User request:\n{user_request}\n\n\
+         Build phase result:\n{build}\n\n\
          Per-file reviews:\n{file_reviews}\n\n\
          Executed checks:\n{checks}\n\n\
          Requirements:\n\
@@ -895,6 +1058,7 @@ fn build_final_review_prompt(
         worktree = worktree.path.display(),
         provider = "delegated-subprocess",
         user_request = render_user_request(options.user_request.as_deref()),
+        build = serde_json::to_string_pretty(build).unwrap_or_default(),
         file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default(),
         checks = serde_json::to_string_pretty(checks).unwrap_or_default()
     )
@@ -913,6 +1077,44 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
     out.push_str("## Executive Summary\n\n");
     out.push_str(report.executive_summary.trim());
     out.push_str("\n\n");
+
+    out.push_str("## Build\n\n");
+    match &report.build {
+        Some(build) => {
+            out.push_str(&format!(
+                "Status: **{}**\n\n{}\n\n",
+                build.status.to_ascii_uppercase(),
+                build.summary.trim()
+            ));
+            if !build.commands_run.is_empty() {
+                out.push_str("Commands run:\n");
+                for (index, command) in build.commands_run.iter().enumerate() {
+                    out.push_str(&format!("{}. `{}`\n", index + 1, command));
+                }
+                out.push('\n');
+            }
+            if !build.stdout_excerpt.trim().is_empty() {
+                out.push_str("Stdout excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(build.stdout_excerpt.trim());
+                out.push_str("\n```\n\n");
+            }
+            if !build.stderr_excerpt.trim().is_empty() {
+                out.push_str("Stderr excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(build.stderr_excerpt.trim());
+                out.push_str("\n```\n\n");
+            }
+            if !build.notes.is_empty() {
+                out.push_str("Build notes:\n");
+                for note in &build.notes {
+                    out.push_str(&format!("- {}\n", note.trim()));
+                }
+                out.push('\n');
+            }
+        }
+        None => out.push_str("Build phase did not run.\n\n"),
+    }
 
     out.push_str("## Summary Findings\n\n");
     if report.summary_findings.is_empty() {

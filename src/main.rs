@@ -60,7 +60,7 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 10)]
     parallelism: usize,
 
     #[arg(long, default_value_t = 600)]

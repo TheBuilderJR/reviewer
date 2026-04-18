@@ -91,6 +91,22 @@ pub struct FinalReviewDraft {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuildExecution {
+    #[serde(default = "default_build_status")]
+    pub status: String,
+    #[serde(default, alias = "result")]
+    pub summary: String,
+    #[serde(default, alias = "commands")]
+    pub commands_run: Vec<String>,
+    #[serde(default)]
+    pub stdout_excerpt: String,
+    #[serde(default)]
+    pub stderr_excerpt: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CheckSpec {
     #[serde(default)]
     pub name: String,
@@ -136,6 +152,7 @@ pub struct FinalReviewReport {
     pub worktree_path: String,
     pub run_artifact_dir: String,
     pub executive_summary: String,
+    pub build: Option<BuildExecution>,
     pub summary_findings: Vec<ReviewFinding>,
     pub inline_comments: Vec<InlineComment>,
     pub checks_summary: String,
@@ -184,11 +201,15 @@ fn default_confidence() -> f32 {
     0.7
 }
 
+fn default_build_status() -> String {
+    "skipped".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{FileReviewDraft, InlineComment};
+    use super::{BuildExecution, FileReviewDraft, InlineComment};
 
     #[test]
     fn deserializes_file_review_without_top_level_file() {
@@ -215,5 +236,17 @@ mod tests {
         let parsed: InlineComment = serde_json::from_value(value).expect("should deserialize");
         assert_eq!(parsed.start_line, Some(17));
         assert_eq!(parsed.body, "This should stay line-anchored.");
+    }
+
+    #[test]
+    fn deserializes_build_execution_with_defaults() {
+        let value = json!({
+            "summary": "Build could not run in this environment."
+        });
+
+        let parsed: BuildExecution = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.status, "skipped");
+        assert_eq!(parsed.summary, "Build could not run in this environment.");
+        assert!(parsed.commands_run.is_empty());
     }
 }
