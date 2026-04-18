@@ -57,7 +57,7 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
 
     #[arg(long, default_value_t = 3)]
@@ -317,4 +317,48 @@ async fn resolve_repo_checkout(
 fn clone_dir_for_repo(repo_name: &str) -> PathBuf {
     let sanitized = repo_name.replace('/', "__");
     std::env::temp_dir().join("reviewer-repos").join(sanitized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn parses_hyphenated_extra_args_value() {
+        let args = Args::try_parse_from([
+            "reviewer",
+            "--provider",
+            "claude",
+            "--extra-args",
+            "--dangerously-skip-permissions",
+            "--pr",
+            "https://github.com/pytorch/pytorch/pull/180747",
+        ])
+        .expect("args should parse");
+
+        assert_eq!(
+            args.extra_args.as_deref(),
+            Some("--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn parses_multi_flag_extra_args_string() {
+        let args = Args::try_parse_from([
+            "reviewer",
+            "--provider",
+            "claude",
+            "--extra-args",
+            "--dangerously-enable-internet-mode --dangerously-skip-permissions",
+            "--pr",
+            "https://github.com/pytorch/pytorch/pull/180747",
+        ])
+        .expect("args should parse");
+
+        assert_eq!(
+            args.extra_args.as_deref(),
+            Some("--dangerously-enable-internet-mode --dangerously-skip-permissions")
+        );
+    }
 }
