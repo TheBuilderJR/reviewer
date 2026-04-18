@@ -16,7 +16,7 @@ For a GitHub PR, the harness:
    - one final PR-level aggregation pass
 4. Produces a ranked review report in Markdown and optional JSON.
 5. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
-6. If `~/.reviewer.md` exists, prepends it to every model prompt as shared reviewer guidance.
+6. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
 7. Streams live progress to stderr for major phases and per-agent start/finish status.
 8. Adds a final `checks` phase that plans at least 5 sanity checks, then executes them sequentially in the PR worktree.
 
@@ -28,6 +28,7 @@ The harness assumes the selected CLI is already authenticated.
 - `gh`
 - `codex` or `claude`
 - access to the target GitHub repo and PR
+- `~/.reviewer.md` with repo-specific build/test/review guidance
 
 ## Usage
 
@@ -89,4 +90,4 @@ Optional controls:
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
 - Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.
 - Those artifact files now include the exact provider argv as JSON, so extra flags like `--dangerously-skip-permissions` are visible after the fact.
-- `~/.reviewer.md` is optional. If present, its contents are injected into every provider prompt, which is the right place for stable instructions like build/test commands, repo-specific invariants, or review priorities.
+- `~/.reviewer.md` is required. If it is missing, the CLI exits immediately and asks the user to create it before any run starts.

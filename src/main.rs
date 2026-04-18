@@ -10,7 +10,7 @@ mod types;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
 use progress::ProgressReporter;
@@ -93,8 +93,8 @@ async fn main() -> Result<()> {
         .repo_path
         .canonicalize()
         .with_context(|| format!("failed to resolve repo path {}", args.repo_path.display()))?;
-    let run_logger = Arc::new(RunLogger::create().await?);
     let prompt_preamble = load_prompt_preamble().await?;
+    let run_logger = Arc::new(RunLogger::create().await?);
     let extra_args = parse_extra_args(args.extra_args.as_deref())?;
 
     progress.info(
@@ -111,19 +111,13 @@ async fn main() -> Result<()> {
         ),
     );
 
-    match &prompt_preamble {
-        Some(preamble) => progress.info(
-            "config",
-            format!(
-                "loaded reviewer instructions from {}",
-                preamble.path.display()
-            ),
+    progress.info(
+        "config",
+        format!(
+            "loaded reviewer instructions from {}",
+            prompt_preamble.path.display()
         ),
-        None => progress.info(
-            "config",
-            "no ~/.reviewer.md found; using built-in prompts only",
-        ),
-    }
+    );
 
     if extra_args.is_empty() {
         progress.info("config", "no provider extra args configured");
@@ -140,7 +134,7 @@ async fn main() -> Result<()> {
         args.agent_timeout_secs,
         run_logger.clone(),
         progress.clone(),
-        prompt_preamble,
+        Some(prompt_preamble),
         extra_args,
     );
 
@@ -211,21 +205,26 @@ fn _provider_name(provider: &Arc<dyn Provider>) -> &str {
     provider.kind().as_str()
 }
 
-async fn load_prompt_preamble() -> Result<Option<PromptPreamble>> {
+async fn load_prompt_preamble() -> Result<PromptPreamble> {
     let Some(home) = std::env::var_os("HOME") else {
-        return Ok(None);
+        bail!(
+            "required reviewer instructions file ~/.reviewer.md could not be resolved because HOME is not set. Create ~/.reviewer.md and rerun reviewer."
+        );
     };
 
     let path = PathBuf::from(home).join(".reviewer.md");
     if !path.exists() {
-        return Ok(None);
+        bail!(
+            "required reviewer instructions file {} was not found. Please create it with repo-specific build/test/review guidance and rerun reviewer.",
+            path.display()
+        );
     }
 
     let content = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
 
-    Ok(Some(PromptPreamble { path, content }))
+    Ok(PromptPreamble { path, content })
 }
 
 fn parse_extra_args(value: Option<&str>) -> Result<Vec<String>> {
