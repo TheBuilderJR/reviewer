@@ -942,11 +942,10 @@ fn build_repo_prompt(
          - If the build fails, stop after enough investigation to explain the blocker clearly.\n\
          - If there is genuinely no usable build guidance in the reviewer instructions, return status `skipped` with a concrete explanation.\n\n\
          Return requirements:\n\
-         - Return a compact JSON object with keys: `status`, `summary`, `commands_run`, `stdout_excerpt`, `stderr_excerpt`, `notes`.\n\
+         - Return a compact JSON object with keys: `status`, `summary`, `commands_run`, `notes`.\n\
          - `status` must be one of: passed, failed, skipped.\n\
          - `commands_run` must contain the exact shell commands you actually executed, in order.\n\
          - `summary` should be a short plain-English result.\n\
-         - `stdout_excerpt` and `stderr_excerpt` should contain only the most relevant output excerpts.\n\
          - Omit fields you do not need instead of filling them with noise.",
         pr_number = pr.number,
         pr_title = pr.title,
@@ -1092,18 +1091,6 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
                     out.push_str(&format!("{}. `{}`\n", index + 1, command));
                 }
                 out.push('\n');
-            }
-            if !build.stdout_excerpt.trim().is_empty() {
-                out.push_str("Stdout excerpt:\n");
-                out.push_str("```text\n");
-                out.push_str(build.stdout_excerpt.trim());
-                out.push_str("\n```\n\n");
-            }
-            if !build.stderr_excerpt.trim().is_empty() {
-                out.push_str("Stderr excerpt:\n");
-                out.push_str("```text\n");
-                out.push_str(build.stderr_excerpt.trim());
-                out.push_str("\n```\n\n");
             }
             if !build.notes.is_empty() {
                 out.push_str("Build notes:\n");

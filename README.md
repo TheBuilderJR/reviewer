@@ -77,9 +77,10 @@ Optional controls:
 
 - Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
 - `~/.reviewer.md` still matters everywhere: the build agent, every file reviewer, the checks planner, and the final review writer all see that shared guidance.
-- The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in both the final Markdown and the `/tmp/run_<uuid>` artifacts.
+- The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in the final Markdown.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
+- Those per-invocation artifacts include the exact captured provider subprocess streams as `subprocess_stdout` and `subprocess_stderr`, so you can inspect the real CLI output instead of model-authored excerpts.
 - Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.
 - Those artifact files now include the exact provider argv as JSON, so extra flags like `--dangerously-skip-permissions` are visible after the fact.
 - `~/.reviewer.md` is required. If it is missing, the CLI exits immediately and asks the user to create it before any run starts.

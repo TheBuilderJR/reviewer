@@ -99,10 +99,6 @@ pub struct BuildExecution {
     #[serde(default, alias = "commands")]
     pub commands_run: Vec<String>,
     #[serde(default)]
-    pub stdout_excerpt: String,
-    #[serde(default)]
-    pub stderr_excerpt: String,
-    #[serde(default)]
     pub notes: Vec<String>,
 }
 

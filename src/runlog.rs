@@ -97,8 +97,8 @@ impl RunLogger {
              metadata: {metadata}\n\
              error: {error_text}\n\n\
              raw_response:\n{raw_response}\n\n\
-             stdout:\n{stdout}\n\n\
-             stderr:\n{stderr}\n\n\
+             subprocess_stdout:\n{stdout}\n\n\
+             subprocess_stderr:\n{stderr}\n\n\
              parsed_json:\n{parsed_text}\n",
             args_json = serde_json::to_string_pretty(args)?,
             cwd = cwd.display(),
@@ -264,7 +264,7 @@ mod tests {
             .expect("transcript should read");
         assert!(transcript.contains("prompt:\nreview this file"));
         assert!(transcript.contains("===== RESPONSE ====="));
-        assert!(transcript.contains("stdout:\nstdout text"));
-        assert!(transcript.contains("stderr:\nstderr text"));
+        assert!(transcript.contains("subprocess_stdout:\nstdout text"));
+        assert!(transcript.contains("subprocess_stderr:\nstderr text"));
     }
 }
