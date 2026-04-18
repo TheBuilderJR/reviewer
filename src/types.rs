@@ -98,6 +98,16 @@ pub struct FinalReviewDraft {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuildExecution {
+    pub status: String,
+    pub summary: String,
+    pub commands_run: Vec<String>,
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CheckSpec {
     pub name: String,
     pub command: String,
@@ -136,6 +146,7 @@ pub struct FinalReviewReport {
     pub worktree_path: String,
     pub run_artifact_dir: String,
     pub executive_summary: String,
+    pub build: Option<BuildExecution>,
     pub checks_summary: String,
     pub ranked_findings: Vec<ReviewFinding>,
     pub per_file: Vec<FileAggregate>,

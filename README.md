@@ -84,7 +84,7 @@ Optional controls:
 
 - The current implementation gathers prior PR context by scanning recent merged PRs and filtering to file matches. That is intentionally simple and may be slow on large repos.
 - Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
-- The current build step is only advisory in progress output; actual build/test execution happens through the final `checks` phase.
+- The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in both the final Markdown and the `/tmp/run_<uuid>` artifacts.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
 - Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.

@@ -16,9 +16,9 @@ use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
 use crate::shell::capture_command_with_input;
 use crate::types::{
-    CheckExecution, CheckPlanDraft, ContextReviewDraft, FileAggregate, FileReviewDraft,
-    FileReviewJob, FinalReviewDraft, FinalReviewReport, HistoricalCommit, HistoricalPr,
-    PullRequestDetails, sort_findings,
+    BuildExecution, CheckExecution, CheckPlanDraft, ContextReviewDraft, FileAggregate,
+    FileReviewDraft, FileReviewJob, FinalReviewDraft, FinalReviewReport, HistoricalCommit,
+    HistoricalPr, PullRequestDetails, sort_findings,
 };
 
 #[derive(Debug, Clone)]
@@ -100,10 +100,9 @@ pub async fn run_review(
         }
     };
 
-    progress.info(
-        "phase",
-        "building repo step is not configured; skipping local build execution",
-    );
+    progress.set_agent_total(1);
+    let build =
+        execute_build_phase(&options, &pr, &worktree, provider.clone(), progress.clone()).await?;
 
     let mut run_result = async {
         let jobs = collect_jobs(&options, &pr, &worktree, progress.clone()).await?;
@@ -125,6 +124,7 @@ pub async fn run_review(
             progress.clone(),
         )
         .await?;
+        report.build = Some(build.clone());
         let check_plan = plan_checks(
             &options,
             &pr,
@@ -317,6 +317,52 @@ async fn review_files(
     Ok(aggregates)
 }
 
+async fn execute_build_phase(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+    provider: Arc<dyn Provider>,
+    progress: Arc<ProgressReporter>,
+) -> Result<BuildExecution> {
+    let step = progress.begin_step("phase", "building repo".to_string());
+    let prompt = build_repo_prompt(options, pr, worktree);
+    let build_result: Result<BuildExecution> = async {
+        let result: BuildExecution = invoke_typed(
+            provider.as_ref(),
+            &worktree.path,
+            &format!("build repo {}", pr.number),
+            &prompt,
+        )
+        .await?;
+        validate_build_execution(&result)?;
+        Ok(result)
+    }
+    .await;
+
+    match build_result {
+        Ok(result) => {
+            let detail = match result.commands_run.is_empty() {
+                true => format!("{}: {}", result.status, result.summary),
+                false => format!(
+                    "{}: {} ({} commands)",
+                    result.status,
+                    result.summary,
+                    result.commands_run.len()
+                ),
+            };
+            match result.status.as_str() {
+                "passed" | "skipped" => step.done(detail),
+                _ => step.fail(detail),
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            step.fail(error.to_string());
+            Err(error)
+        }
+    }
+}
+
 async fn review_single_file(
     semaphore: &Arc<Semaphore>,
     provider: Arc<dyn Provider>,
@@ -435,6 +481,7 @@ async fn aggregate_final_report(
         worktree_path: worktree.path.display().to_string(),
         run_artifact_dir: String::new(),
         executive_summary: draft.executive_summary,
+        build: None,
         checks_summary: String::new(),
         ranked_findings,
         per_file: aggregates,
@@ -643,6 +690,26 @@ fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
     Ok(())
 }
 
+fn validate_build_execution(result: &BuildExecution) -> Result<()> {
+    anyhow::ensure!(
+        matches!(result.status.as_str(), "passed" | "failed" | "skipped"),
+        "build phase returned unsupported status `{}`",
+        result.status
+    );
+    anyhow::ensure!(
+        !result.summary.trim().is_empty(),
+        "build phase returned an empty summary"
+    );
+    if result.status != "skipped" {
+        anyhow::ensure!(
+            !result.commands_run.is_empty(),
+            "build phase must report at least one command when status is {}",
+            result.status
+        );
+    }
+    Ok(())
+}
+
 async fn invoke_with_semaphore<T>(
     semaphore: &Arc<Semaphore>,
     provider: &dyn Provider,
@@ -827,6 +894,54 @@ fn build_final_report_prompt(
     )
 }
 
+fn build_repo_prompt(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+) -> String {
+    let changed_files = pr
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "- {} (+{} / -{})",
+                file.path, file.additions, file.deletions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are the repo build phase agent for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         Worktree path: {worktree}\n\
+         Base branch: {base}\n\
+         PR URL: {pr_url}\n\n\
+         User request:\n{user_request}\n\n\
+         Changed files:\n{changed_files}\n\n\
+         Task:\n\
+         - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built or prepared.\n\
+         - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
+         - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
+         - Keep the run non-interactive.\n\
+         - If the build fails, stop after enough investigation to explain the blocker clearly.\n\
+         - If there is genuinely no usable build guidance in the reviewer instructions, return status `skipped` with a concrete explanation.\n\n\
+         Return requirements:\n\
+         - status must be one of: passed, failed, skipped\n\
+         - commands_run must contain the exact shell commands you actually executed, in order\n\
+         - summary should be a short plain-English result\n\
+         - stdout_excerpt and stderr_excerpt should contain only the most relevant output excerpts\n\
+         - notes should capture blockers, environment assumptions, or follow-up actions",
+        pr_number = pr.number,
+        pr_title = pr.title,
+        repo = options.repo_name,
+        worktree = worktree.path.display(),
+        base = pr.base_ref_name,
+        pr_url = pr.url,
+        user_request = render_user_request(options.user_request.as_deref()),
+        changed_files = changed_files
+    )
+}
+
 fn build_check_plan_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
@@ -900,6 +1015,46 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
     out.push_str("## Executive Summary\n\n");
     out.push_str(report.executive_summary.trim());
     out.push_str("\n\n");
+
+    out.push_str("## Build\n\n");
+    match &report.build {
+        Some(build) => {
+            out.push_str(&format!(
+                "Status: **{}**\n\n{}\n\n",
+                build.status.to_ascii_uppercase(),
+                build.summary.trim()
+            ));
+            if !build.commands_run.is_empty() {
+                out.push_str("Commands run:\n");
+                for (index, command) in build.commands_run.iter().enumerate() {
+                    out.push_str(&format!("{}. `{}`\n", index + 1, command));
+                }
+                out.push('\n');
+            }
+            if !build.stdout_excerpt.trim().is_empty() {
+                out.push_str("Stdout excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(build.stdout_excerpt.trim());
+                out.push_str("\n```\n\n");
+            }
+            if !build.stderr_excerpt.trim().is_empty() {
+                out.push_str("Stderr excerpt:\n");
+                out.push_str("```text\n");
+                out.push_str(build.stderr_excerpt.trim());
+                out.push_str("\n```\n\n");
+            }
+            if !build.notes.is_empty() {
+                out.push_str("Build notes:\n");
+                for note in &build.notes {
+                    out.push_str(&format!("- {}\n", note.trim()));
+                }
+                out.push('\n');
+            }
+        }
+        None => {
+            out.push_str("Build phase did not run.\n\n");
+        }
+    }
 
     out.push_str("## Ranked Findings\n\n");
     if report.ranked_findings.is_empty() {
