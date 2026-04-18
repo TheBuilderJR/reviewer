@@ -30,55 +30,85 @@ pub struct FileReviewJob {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewFinding {
+    #[serde(default)]
     pub file: String,
+    #[serde(default, alias = "label", alias = "summary")]
     pub title: String,
+    #[serde(default = "default_priority")]
     pub priority: u8,
+    #[serde(default = "default_confidence")]
     pub confidence: f32,
+    #[serde(default, alias = "body", alias = "reason", alias = "why")]
     pub rationale: String,
+    #[serde(default, alias = "fix", alias = "suggestion")]
     pub suggested_fix: String,
+    #[serde(default, alias = "references")]
     pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InlineComment {
+    #[serde(default, alias = "path")]
     pub file: String,
+    #[serde(default, alias = "line", alias = "line_number")]
     pub start_line: Option<usize>,
+    #[serde(default)]
     pub end_line: Option<usize>,
+    #[serde(default, alias = "summary", alias = "label")]
     pub title: String,
+    #[serde(default = "default_priority")]
     pub priority: u8,
+    #[serde(default = "default_confidence")]
     pub confidence: f32,
+    #[serde(default, alias = "comment", alias = "message", alias = "rationale")]
     pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FileReviewDraft {
+    #[serde(default)]
     pub file: String,
+    #[serde(default, alias = "executive_summary")]
     pub summary: String,
+    #[serde(default)]
     pub findings: Vec<ReviewFinding>,
+    #[serde(default)]
     pub inline_comments: Vec<InlineComment>,
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FinalReviewDraft {
+    #[serde(default, alias = "summary")]
     pub executive_summary: String,
+    #[serde(default, alias = "findings")]
     pub summary_findings: Vec<ReviewFinding>,
+    #[serde(default)]
     pub inline_comments: Vec<InlineComment>,
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CheckSpec {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub command: String,
+    #[serde(default, alias = "why")]
     pub rationale: String,
+    #[serde(default, alias = "expected")]
     pub expected_signal: String,
+    #[serde(default, alias = "related")]
     pub related_findings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CheckPlanDraft {
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub checks: Vec<CheckSpec>,
 }
 
@@ -144,4 +174,46 @@ pub fn sort_inline_comments(comments: &mut [InlineComment]) {
             })
             .then_with(|| left.title.cmp(&right.title))
     });
+}
+
+fn default_priority() -> u8 {
+    2
+}
+
+fn default_confidence() -> f32 {
+    0.7
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{FileReviewDraft, InlineComment};
+
+    #[test]
+    fn deserializes_file_review_without_top_level_file() {
+        let value = json!({
+            "summary": "Looks fine overall.",
+            "findings": [],
+            "inline_comments": [],
+            "notes": []
+        });
+
+        let parsed: FileReviewDraft = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.file, "");
+        assert_eq!(parsed.summary, "Looks fine overall.");
+    }
+
+    #[test]
+    fn deserializes_inline_comment_line_alias() {
+        let value = json!({
+            "title": "Use a tuple append here",
+            "line": 17,
+            "comment": "This should stay line-anchored."
+        });
+
+        let parsed: InlineComment = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.start_line, Some(17));
+        assert_eq!(parsed.body, "This should stay line-anchored.");
+    }
 }

@@ -277,7 +277,7 @@ async fn review_single_file(
     user_request: Option<&str>,
 ) -> Result<FileReviewDraft> {
     let prompt = build_file_review_prompt(pr, &job, worktree_path, user_request);
-    let review: FileReviewDraft = invoke_with_semaphore(
+    let mut review: FileReviewDraft = invoke_with_semaphore(
         semaphore,
         provider.as_ref(),
         worktree_path,
@@ -285,6 +285,7 @@ async fn review_single_file(
         &prompt,
     )
     .await?;
+    normalize_file_review(&job, &mut review);
     validate_file_review(&job, &review)?;
     Ok(review)
 }
@@ -484,13 +485,14 @@ async fn write_final_review(
 
     let prompt = build_final_review_prompt(options, pr, &file_reviews, &checks, worktree);
     let draft_result: Result<FinalReviewDraft> = async {
-        let draft: FinalReviewDraft = invoke_typed(
+        let mut draft: FinalReviewDraft = invoke_typed(
             provider.as_ref(),
             &worktree.path,
             &format!("write final review {}", pr.number),
             &prompt,
         )
         .await?;
+        normalize_final_review(&mut draft);
         validate_final_review(&draft)?;
         Ok(draft)
     }
@@ -547,12 +549,6 @@ fn validate_file_review(job: &FileReviewJob, review: &FileReviewDraft) -> Result
 
     for (index, finding) in review.findings.iter().enumerate() {
         anyhow::ensure!(
-            !finding.file.trim().is_empty(),
-            "file review finding {} for {} is missing a file",
-            index + 1,
-            job.file
-        );
-        anyhow::ensure!(
             !finding.title.trim().is_empty(),
             "file review finding {} for {} is missing a title",
             index + 1,
@@ -561,12 +557,6 @@ fn validate_file_review(job: &FileReviewJob, review: &FileReviewDraft) -> Result
     }
 
     for (index, comment) in review.inline_comments.iter().enumerate() {
-        anyhow::ensure!(
-            !comment.file.trim().is_empty(),
-            "inline comment {} for {} is missing a file",
-            index + 1,
-            job.file
-        );
         anyhow::ensure!(
             !comment.title.trim().is_empty(),
             "inline comment {} for {} is missing a title",
@@ -615,11 +605,6 @@ fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
 
     for (index, finding) in draft.summary_findings.iter().enumerate() {
         anyhow::ensure!(
-            !finding.file.trim().is_empty(),
-            "summary finding {} is missing a file",
-            index + 1
-        );
-        anyhow::ensure!(
             !finding.title.trim().is_empty(),
             "summary finding {} is missing a title",
             index + 1
@@ -627,11 +612,6 @@ fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
     }
 
     for (index, comment) in draft.inline_comments.iter().enumerate() {
-        anyhow::ensure!(
-            !comment.file.trim().is_empty(),
-            "final inline comment {} is missing a file",
-            index + 1
-        );
         anyhow::ensure!(
             !comment.title.trim().is_empty(),
             "final inline comment {} is missing a title",
@@ -645,6 +625,124 @@ fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_file_review(job: &FileReviewJob, review: &mut FileReviewDraft) {
+    if review.file.trim().is_empty() {
+        review.file = job.file.clone();
+    }
+
+    for finding in &mut review.findings {
+        normalize_review_finding(finding, Some(&job.file));
+    }
+    for comment in &mut review.inline_comments {
+        normalize_inline_comment(comment, Some(&job.file));
+    }
+
+    if review.summary.trim().is_empty() {
+        review.summary =
+            fallback_review_summary(review.findings.len(), review.inline_comments.len());
+    }
+}
+
+fn normalize_final_review(draft: &mut FinalReviewDraft) {
+    for finding in &mut draft.summary_findings {
+        normalize_review_finding(finding, None);
+    }
+    for comment in &mut draft.inline_comments {
+        normalize_inline_comment(comment, None);
+    }
+
+    if draft.executive_summary.trim().is_empty() {
+        draft.executive_summary =
+            fallback_final_summary(draft.summary_findings.len(), draft.inline_comments.len());
+    }
+}
+
+fn normalize_review_finding(
+    finding: &mut crate::types::ReviewFinding,
+    fallback_file: Option<&str>,
+) {
+    if finding.file.trim().is_empty() {
+        finding.file = fallback_file.unwrap_or("unknown").to_string();
+    }
+    if finding.title.trim().is_empty() {
+        finding.title = first_nonempty_line(&finding.rationale)
+            .or_else(|| first_nonempty_line(&finding.suggested_fix))
+            .unwrap_or_else(|| "Review finding".to_string());
+    }
+    if finding.rationale.trim().is_empty() {
+        finding.rationale = format!("Potential issue identified in {}.", finding.file);
+    }
+    if finding.suggested_fix.trim().is_empty() {
+        finding.suggested_fix =
+            "Investigate the issue and update the implementation or tests.".to_string();
+    }
+    if finding.priority > 3 {
+        finding.priority = 3;
+    }
+    if !finding.confidence.is_finite() || finding.confidence <= 0.0 {
+        finding.confidence = 0.7;
+    } else if finding.confidence > 1.0 {
+        finding.confidence = 1.0;
+    }
+    if finding.source_refs.is_empty() {
+        finding.source_refs.push(finding.file.clone());
+    }
+}
+
+fn normalize_inline_comment(comment: &mut InlineComment, fallback_file: Option<&str>) {
+    if comment.file.trim().is_empty() {
+        comment.file = fallback_file.unwrap_or("unknown").to_string();
+    }
+    if comment.end_line.is_none() {
+        comment.end_line = comment.start_line;
+    }
+    if comment.title.trim().is_empty() {
+        comment.title =
+            first_nonempty_line(&comment.body).unwrap_or_else(|| "Review comment".to_string());
+    }
+    if comment.body.trim().is_empty() {
+        comment.body = comment.title.clone();
+    }
+    if comment.priority > 3 {
+        comment.priority = 3;
+    }
+    if !comment.confidence.is_finite() || comment.confidence <= 0.0 {
+        comment.confidence = 0.7;
+    } else if comment.confidence > 1.0 {
+        comment.confidence = 1.0;
+    }
+}
+
+fn fallback_review_summary(findings: usize, comments: usize) -> String {
+    if findings == 0 && comments == 0 {
+        "No substantive issues found in this starting-file review.".to_string()
+    } else {
+        format!(
+            "Review captured {} findings and {} inline comments.",
+            findings, comments
+        )
+    }
+}
+
+fn fallback_final_summary(findings: usize, comments: usize) -> String {
+    if findings == 0 && comments == 0 {
+        "Review completed without high-confidence issues.".to_string()
+    } else {
+        format!(
+            "Review completed with {} summary findings and {} inline comments.",
+            findings, comments
+        )
+    }
+}
+
+fn first_nonempty_line(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
 }
 
 async fn invoke_with_semaphore<T>(
@@ -679,6 +777,11 @@ fn build_file_review_prompt(
          - Inspect any nearby or dependent files you need, but keep the review centered on the starting file.\n\
          - Report only substantive correctness, regression, reliability, or maintainability issues.\n\
          - Ignore style-only nits and duplicate observations.\n\
+         - Return a compact JSON object with keys: `summary`, `findings`, `inline_comments`, `notes`.\n\
+         - Do not include a top-level `file` field; the harness already knows the starting file.\n\
+         - In `findings`, the `file` field is optional and defaults to the starting file.\n\
+         - In `inline_comments`, `file` is optional and defaults to the starting file. Use either `line` or `start_line`; `end_line` is optional.\n\
+         - If a field is not important, omit it instead of inventing filler values.\n\
          - Return at most 5 findings and at most 5 inline comments.\n\
          - Inline comments should be line-anchored when possible. If exact lines are unclear, use a file-level comment with null line numbers.\n\
          - Inline comments can mention another file only when it is directly necessary to explain why the starting file's change is wrong.\n\
@@ -736,13 +839,14 @@ fn build_check_plan_prompt(
          Changed test-like files:\n{changed_test_files}\n\n\
          Per-file review results:\n{file_reviews}\n\n\
          Requirements:\n\
+         - Return a compact JSON object with keys: `summary` and `checks`.\n\
          - Return at least 5 checks.\n\
          - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
          - Use repo-specific guidance from the global reviewer instructions when available, especially for build/test commands.\n\
          - Prefer targeted checks first, then broader validation where useful.\n\
          - Avoid duplicate commands.\n\
-         - Every check must include a clear rationale and the expected signal to inspect.\n\
+         - Every check should include a clear rationale and expected signal, but those fields can be brief.\n\
          - Related findings should cite finding titles, inline comment titles, or file paths, not vague references.",
         pr_number = pr.number,
         pr_title = pr.title,
@@ -774,6 +878,10 @@ fn build_final_review_prompt(
          Per-file reviews:\n{file_reviews}\n\n\
          Executed checks:\n{checks}\n\n\
          Requirements:\n\
+         - Return a compact JSON object with keys: `executive_summary`, `summary_findings`, `inline_comments`, `notes`.\n\
+         - In `summary_findings`, `file`, `priority`, `confidence`, `suggested_fix`, and `source_refs` are optional when they are obvious from context.\n\
+         - In `inline_comments`, `file` is optional if obvious from context. Use either `line` or `start_line`; `end_line` is optional.\n\
+         - Omit fields you are unsure about rather than inventing values.\n\
          - Write a concise executive summary of the real review outcome after considering the checks.\n\
          - Return at most 10 summary findings.\n\
          - Return all inline comments that should actually be left on the PR, deduplicated and filtered against the check results.\n\

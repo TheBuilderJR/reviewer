@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -103,7 +105,18 @@ impl RunLogger {
             metadata = invocation.metadata,
         );
 
-        self.write_stage(invocation, "response", &body).await
+        let response_path = self.write_stage(invocation, "response", &body).await?;
+        let transcript_path = self.artifact_path(invocation, "initial-prompt", "txt");
+        self.append_to_path(
+            &transcript_path,
+            &format!(
+                "\n\n===== RESPONSE =====\nresponse_artifact: {}\n\n{}",
+                response_path.display(),
+                body
+            ),
+        )
+        .await?;
+        Ok(response_path)
     }
 
     pub async fn write_text(
@@ -143,6 +156,20 @@ impl RunLogger {
             .await
             .with_context(|| format!("failed writing run artifact {}", path.display()))?;
         Ok(path)
+    }
+
+    async fn append_to_path(&self, path: &Path, body: &str) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .await
+            .with_context(|| {
+                format!("failed opening run artifact {} for append", path.display())
+            })?;
+        file.write_all(body.as_bytes())
+            .await
+            .with_context(|| format!("failed appending run artifact {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -187,12 +214,57 @@ fn short_hash(value: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_metadata;
+    use std::path::Path;
+
+    use serde_json::json;
+
+    use super::{RunLogger, sanitize_metadata};
 
     #[test]
     fn sanitizes_and_hashes_metadata() {
         let value = sanitize_metadata("review_src/foo.bar");
         assert!(value.starts_with("review-src-foo-bar-"));
         assert!(value.len() > "review-src-foo-bar-".len());
+    }
+
+    #[tokio::test]
+    async fn appends_response_to_prompt_transcript() {
+        let logger = RunLogger::create().await.expect("logger should create");
+        let invocation = logger.begin("review src/lib.rs");
+        let schema = json!({"type": "object"});
+        let prompt_path = logger
+            .write_prompt(
+                &invocation,
+                "claude",
+                &["-p".to_string()],
+                Path::new("/tmp"),
+                &schema,
+                "review this file",
+            )
+            .await
+            .expect("prompt should write");
+
+        logger
+            .write_response(
+                &invocation,
+                "claude",
+                &["-p".to_string()],
+                Path::new("/tmp"),
+                "{\"ok\":true}",
+                "stdout text",
+                "stderr text",
+                Some(&json!({"ok": true})),
+                None,
+            )
+            .await
+            .expect("response should write");
+
+        let transcript = tokio::fs::read_to_string(&prompt_path)
+            .await
+            .expect("transcript should read");
+        assert!(transcript.contains("prompt:\nreview this file"));
+        assert!(transcript.contains("===== RESPONSE ====="));
+        assert!(transcript.contains("stdout:\nstdout text"));
+        assert!(transcript.contains("stderr:\nstderr text"));
     }
 }
