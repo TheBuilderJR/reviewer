@@ -60,15 +60,6 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
 
-    #[arg(long, default_value_t = 3)]
-    max_commits_per_file: usize,
-
-    #[arg(long, default_value_t = 2)]
-    max_prs_per_file: usize,
-
-    #[arg(long, default_value_t = 30)]
-    pr_scan_limit: usize,
-
     #[arg(long, default_value_t = 4)]
     parallelism: usize,
 
@@ -150,9 +141,6 @@ async fn main() -> Result<()> {
         repo_name,
         repo_path,
         user_request: None,
-        max_commits_per_file: args.max_commits_per_file,
-        max_prs_per_file: args.max_prs_per_file,
-        pr_scan_limit: args.pr_scan_limit,
         parallelism: args.parallelism.max(1),
         check_timeout_secs: args.check_timeout_secs,
         keep_worktree: args.keep_worktree,

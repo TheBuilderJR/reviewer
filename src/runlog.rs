@@ -115,16 +115,30 @@ impl RunLogger {
         self.write_stage(invocation, run_type, body).await
     }
 
+    pub fn artifact_path(
+        &self,
+        invocation: &InvocationLog,
+        run_type: &str,
+        extension: &str,
+    ) -> PathBuf {
+        let extension = extension.trim_start_matches('.');
+        self.root.join(format!(
+            "{}_{}_{}_{}.{}",
+            invocation.timestamp_secs,
+            run_type,
+            invocation.metadata,
+            invocation.sequence,
+            extension
+        ))
+    }
+
     async fn write_stage(
         &self,
         invocation: &InvocationLog,
         run_type: &str,
         body: &str,
     ) -> Result<PathBuf> {
-        let path = self.root.join(format!(
-            "{}_{}_{}_{}.txt",
-            invocation.timestamp_secs, run_type, invocation.metadata, invocation.sequence
-        ));
+        let path = self.artifact_path(invocation, run_type, "txt");
         tokio::fs::write(&path, body)
             .await
             .with_context(|| format!("failed writing run artifact {}", path.display()))?;

@@ -8,17 +8,16 @@ use tokio::sync::Semaphore;
 
 use crate::git::{
     Worktree, cleanup_worktree, create_pr_worktree, diff_for_file, fetch_base_branch,
-    fetch_pr_head_ref, recent_commits_for_file,
+    fetch_pr_head_ref,
 };
-use crate::github::{fetch_pr_details, find_recent_prs_for_file};
+use crate::github::fetch_pr_details;
 use crate::progress::ProgressReporter;
 use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
 use crate::shell::capture_command_with_input;
 use crate::types::{
-    BuildExecution, CheckExecution, CheckPlanDraft, ContextReviewDraft, FileAggregate,
-    FileReviewDraft, FileReviewJob, FinalReviewDraft, FinalReviewReport, HistoricalCommit,
-    HistoricalPr, PullRequestDetails, sort_findings,
+    CheckExecution, CheckPlanDraft, FileReviewDraft, FileReviewJob, FinalReviewDraft,
+    FinalReviewReport, InlineComment, PullRequestDetails, sort_findings, sort_inline_comments,
 };
 
 #[derive(Debug, Clone)]
@@ -27,9 +26,6 @@ pub struct ReviewOptions {
     pub repo_name: String,
     pub repo_path: PathBuf,
     pub user_request: Option<String>,
-    pub max_commits_per_file: usize,
-    pub max_prs_per_file: usize,
-    pub pr_scan_limit: usize,
     pub parallelism: usize,
     pub check_timeout_secs: u64,
     pub keep_worktree: bool,
@@ -100,13 +96,10 @@ pub async fn run_review(
         }
     };
 
-    progress.set_agent_total(1);
-    let build =
-        execute_build_phase(&options, &pr, &worktree, provider.clone(), progress.clone()).await?;
-
     let mut run_result = async {
-        let jobs = collect_jobs(&options, &pr, &worktree, progress.clone()).await?;
-        let aggregates = review_files(
+        let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
+        progress.set_agent_total(jobs.len() + 2);
+        let file_reviews = review_files(
             &options,
             &pr,
             &worktree,
@@ -115,21 +108,11 @@ pub async fn run_review(
             progress.clone(),
         )
         .await?;
-        let mut report = aggregate_final_report(
-            &options,
-            &pr,
-            &worktree,
-            aggregates,
-            provider.clone(),
-            progress.clone(),
-        )
-        .await?;
-        report.build = Some(build.clone());
         let check_plan = plan_checks(
             &options,
             &pr,
             &worktree,
-            &report,
+            &file_reviews,
             provider.clone(),
             progress.clone(),
         )
@@ -142,9 +125,18 @@ pub async fn run_review(
             progress.clone(),
         )
         .await?;
-        report.checks_summary = summarize_checks(&check_plan.summary, &checks);
-        report.checks = checks;
-        Ok(report)
+        let checks_summary = summarize_checks(&check_plan.summary, &checks);
+        write_final_review(
+            &options,
+            &pr,
+            &worktree,
+            file_reviews,
+            checks,
+            checks_summary,
+            provider.clone(),
+            progress.clone(),
+        )
+        .await
     }
     .await;
 
@@ -180,8 +172,7 @@ pub async fn run_review(
     run_result
 }
 
-async fn collect_jobs(
-    options: &ReviewOptions,
+async fn prepare_file_jobs(
     pr: &PullRequestDetails,
     worktree: &Worktree,
     progress: Arc<ProgressReporter>,
@@ -190,64 +181,28 @@ async fn collect_jobs(
     let step = progress.begin_step(
         "phase",
         format!(
-            "aggregating historical commits/PRs that touch {} files",
+            "preparing file review jobs for {} changed files",
             total_files
         ),
     );
-    let mut jobs = Vec::new();
+    let mut jobs = Vec::with_capacity(total_files);
 
     for (index, file) in pr.files.iter().enumerate() {
         progress.info(
-            "history",
-            format!("[{}/{}] scanning {}", index + 1, total_files, file.path),
+            "review",
+            format!("[{}/{}] preparing {}", index + 1, total_files, file.path),
         );
         let diff_excerpt = diff_for_file(&worktree.path, &pr.base_ref_name, &file.path)
             .await
             .map(|value| excerpt(&value, 16_000))
             .unwrap_or_default();
 
-        let recent_commits = recent_commits_for_file(
-            &worktree.path,
-            &pr.base_ref_name,
-            &file.path,
-            options.max_commits_per_file,
-        )
-        .await
-        .with_context(|| format!("failed to gather commit history for {}", file.path))?;
-
-        let recent_prs = find_recent_prs_for_file(
-            &options.repo_path,
-            &options.repo_name,
-            pr.number,
-            &file.path,
-            options.pr_scan_limit,
-            options.max_prs_per_file,
-        )
-        .await
-        .with_context(|| format!("failed to gather prior PRs for {}", file.path))?;
-
         jobs.push(FileReviewJob {
             file: file.path.clone(),
             additions: file.additions,
             deletions: file.deletions,
             diff_excerpt,
-            recent_commits,
-            recent_prs,
         });
-
-        if let Some(job) = jobs.last() {
-            progress.info(
-                "history",
-                format!(
-                    "[{}/{}] {} -> {} commits, {} prior PRs",
-                    index + 1,
-                    total_files,
-                    job.file,
-                    job.recent_commits.len(),
-                    job.recent_prs.len()
-                ),
-            );
-        }
     }
 
     step.done(format!("{} file review jobs ready", jobs.len()));
@@ -261,12 +216,10 @@ async fn review_files(
     jobs: Vec<FileReviewJob>,
     provider: Arc<dyn Provider>,
     progress: Arc<ProgressReporter>,
-) -> Result<Vec<FileAggregate>> {
-    let total_invocations = jobs.iter().map(planned_invocations_for_job).sum::<usize>() + 2;
-    progress.set_agent_total(total_invocations);
+) -> Result<Vec<FileReviewDraft>> {
     let queue_step = progress.begin_step(
         "phase",
-        format!("spawning subagents for {} changed files", jobs.len()),
+        format!("spawning file reviewers for {} changed files", jobs.len()),
     );
 
     let semaphore = Arc::new(Semaphore::new(options.parallelism));
@@ -277,16 +230,14 @@ async fn review_files(
         progress.info(
             "agents",
             format!(
-                "[{}/{}] queued {} provider invocations for {}",
+                "[{}/{}] queued review for {}",
                 index + 1,
                 total_files,
-                planned_invocations_for_job(&job),
                 job.file
             ),
         );
         let semaphore = semaphore.clone();
         let provider = provider.clone();
-        let progress = progress.clone();
         let worktree_path = worktree.path.clone();
         let pr = pr.clone();
         let user_request = options.user_request.clone();
@@ -298,69 +249,23 @@ async fn review_files(
                 &pr,
                 job,
                 user_request.as_deref(),
-                progress,
             )
             .await
         }));
     }
 
     queue_step.done(format!(
-        "{} provider invocations queued with parallelism={}",
-        total_invocations, options.parallelism
+        "{} file reviewers queued with parallelism={}",
+        total_files, options.parallelism
     ));
 
     let results = join_all(tasks).await;
-    let mut aggregates = Vec::new();
+    let mut reviews = Vec::with_capacity(total_files);
     for result in results {
-        aggregates.push(result.context("file review task panicked")??);
+        reviews.push(result.context("file review task panicked")??);
     }
-    Ok(aggregates)
-}
-
-async fn execute_build_phase(
-    options: &ReviewOptions,
-    pr: &PullRequestDetails,
-    worktree: &Worktree,
-    provider: Arc<dyn Provider>,
-    progress: Arc<ProgressReporter>,
-) -> Result<BuildExecution> {
-    let step = progress.begin_step("phase", "building repo".to_string());
-    let prompt = build_repo_prompt(options, pr, worktree);
-    let build_result: Result<BuildExecution> = async {
-        let result: BuildExecution = invoke_typed(
-            provider.as_ref(),
-            &worktree.path,
-            &format!("build repo {}", pr.number),
-            &prompt,
-        )
-        .await?;
-        validate_build_execution(&result)?;
-        Ok(result)
-    }
-    .await;
-
-    match build_result {
-        Ok(result) => {
-            let detail = match result.commands_run.is_empty() {
-                true => format!("{}: {}", result.status, result.summary),
-                false => format!(
-                    "{}: {} ({} commands)",
-                    result.status,
-                    result.summary,
-                    result.commands_run.len()
-                ),
-            };
-            match result.status.as_str() {
-                "passed" | "skipped" => step.done(detail),
-                _ => step.fail(detail),
-            }
-            Ok(result)
-        }
-        Err(error) => {
-            step.fail(error.to_string());
-            Err(error)
-        }
-    }
+    reviews.sort_by(|left, right| left.file.cmp(&right.file));
+    Ok(reviews)
 }
 
 async fn review_single_file(
@@ -370,141 +275,30 @@ async fn review_single_file(
     pr: &PullRequestDetails,
     job: FileReviewJob,
     user_request: Option<&str>,
-    progress: Arc<ProgressReporter>,
-) -> Result<FileAggregate> {
-    progress.info(
-        "file",
-        format!(
-            "{} -> current review + {} commit contexts + {} PR contexts + file aggregate",
-            job.file,
-            job.recent_commits.len(),
-            job.recent_prs.len()
-        ),
-    );
-    let base_prompt = build_current_file_prompt(pr, &job, worktree_path, user_request);
-    let base_review: FileReviewDraft = invoke_with_semaphore(
+) -> Result<FileReviewDraft> {
+    let prompt = build_file_review_prompt(pr, &job, worktree_path, user_request);
+    let review: FileReviewDraft = invoke_with_semaphore(
         semaphore,
         provider.as_ref(),
         worktree_path,
         &format!("review {}", job.file),
-        &base_prompt,
-    )
-    .await?;
-
-    let mut context_tasks = Vec::new();
-
-    for commit in job.recent_commits.clone() {
-        let prompt = build_commit_context_prompt(pr, &job, &commit, worktree_path, user_request);
-        let label = format!("context commit {} {}", short_sha(&commit.sha), job.file);
-        let semaphore = semaphore.clone();
-        let provider = provider.clone();
-        let cwd = worktree_path.clone();
-        context_tasks.push(tokio::spawn(async move {
-            invoke_with_semaphore::<ContextReviewDraft>(
-                &semaphore,
-                provider.as_ref(),
-                &cwd,
-                &label,
-                &prompt,
-            )
-            .await
-        }));
-    }
-
-    for prior_pr in job.recent_prs.clone() {
-        let prompt = build_pr_context_prompt(pr, &job, &prior_pr, worktree_path, user_request);
-        let label = format!("context pr {} {}", prior_pr.number, job.file);
-        let semaphore = semaphore.clone();
-        let provider = provider.clone();
-        let cwd = worktree_path.clone();
-        context_tasks.push(tokio::spawn(async move {
-            invoke_with_semaphore::<ContextReviewDraft>(
-                &semaphore,
-                provider.as_ref(),
-                &cwd,
-                &label,
-                &prompt,
-            )
-            .await
-        }));
-    }
-
-    let mut context_reviews = Vec::new();
-    for task in join_all(context_tasks).await {
-        context_reviews.push(task.context("context review task panicked")??);
-    }
-
-    let aggregate_prompt =
-        build_file_aggregate_prompt(pr, &job, &base_review, &context_reviews, user_request);
-    invoke_with_semaphore::<FileAggregate>(
-        semaphore,
-        provider.as_ref(),
-        worktree_path,
-        &format!("aggregate file {}", job.file),
-        &aggregate_prompt,
-    )
-    .await
-}
-
-async fn aggregate_final_report(
-    options: &ReviewOptions,
-    pr: &PullRequestDetails,
-    worktree: &Worktree,
-    mut aggregates: Vec<FileAggregate>,
-    provider: Arc<dyn Provider>,
-    progress: Arc<ProgressReporter>,
-) -> Result<FinalReviewReport> {
-    let step = progress.begin_step("phase", "aggregating and ranking reviews".to_string());
-    for aggregate in &mut aggregates {
-        sort_findings(&mut aggregate.findings);
-    }
-    aggregates.sort_by(|left, right| left.file.cmp(&right.file));
-
-    let prompt = build_final_report_prompt(options, pr, &aggregates, worktree);
-    let draft: FinalReviewDraft = invoke_typed(
-        provider.as_ref(),
-        &worktree.path,
-        &format!("aggregate pr {}", pr.number),
         &prompt,
     )
     .await?;
-
-    let mut ranked_findings = draft.ranked_findings;
-    sort_findings(&mut ranked_findings);
-    let file_count = aggregates.len();
-    let findings_count = ranked_findings.len();
-    let report = FinalReviewReport {
-        repo: options.repo_name.clone(),
-        pr_number: pr.number,
-        pr_title: pr.title.clone(),
-        provider: provider.kind().as_str().to_string(),
-        worktree_path: worktree.path.display().to_string(),
-        run_artifact_dir: String::new(),
-        executive_summary: draft.executive_summary,
-        build: None,
-        checks_summary: String::new(),
-        ranked_findings,
-        per_file: aggregates,
-        checks: Vec::new(),
-        notes: draft.notes,
-    };
-    step.done(format!(
-        "{} ranked findings across {} files",
-        findings_count, file_count
-    ));
-    Ok(report)
+    validate_file_review(&job, &review)?;
+    Ok(review)
 }
 
 async fn plan_checks(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     worktree: &Worktree,
-    report: &FinalReviewReport,
+    file_reviews: &[FileReviewDraft],
     provider: Arc<dyn Provider>,
     progress: Arc<ProgressReporter>,
 ) -> Result<CheckPlanDraft> {
     let step = progress.begin_step("phase", "planning checks".to_string());
-    let prompt = build_check_plan_prompt(options, pr, report, worktree);
+    let prompt = build_check_plan_prompt(options, pr, file_reviews, worktree);
     let plan_result: Result<CheckPlanDraft> = async {
         let plan: CheckPlanDraft = invoke_typed(
             provider.as_ref(),
@@ -667,6 +461,129 @@ async fn run_checks(
     Ok(executions)
 }
 
+async fn write_final_review(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    worktree: &Worktree,
+    mut file_reviews: Vec<FileReviewDraft>,
+    checks: Vec<CheckExecution>,
+    checks_summary: String,
+    provider: Arc<dyn Provider>,
+    progress: Arc<ProgressReporter>,
+) -> Result<FinalReviewReport> {
+    let step = progress.begin_step(
+        "phase",
+        "writing final review summary and inline comments".to_string(),
+    );
+
+    for review in &mut file_reviews {
+        sort_findings(&mut review.findings);
+        sort_inline_comments(&mut review.inline_comments);
+    }
+    file_reviews.sort_by(|left, right| left.file.cmp(&right.file));
+
+    let prompt = build_final_review_prompt(options, pr, &file_reviews, &checks, worktree);
+    let draft_result: Result<FinalReviewDraft> = async {
+        let draft: FinalReviewDraft = invoke_typed(
+            provider.as_ref(),
+            &worktree.path,
+            &format!("write final review {}", pr.number),
+            &prompt,
+        )
+        .await?;
+        validate_final_review(&draft)?;
+        Ok(draft)
+    }
+    .await;
+
+    match draft_result {
+        Ok(draft) => {
+            let mut summary_findings = draft.summary_findings;
+            let mut inline_comments = draft.inline_comments;
+            sort_findings(&mut summary_findings);
+            sort_inline_comments(&mut inline_comments);
+            let summary_count = summary_findings.len();
+            let comment_count = inline_comments.len();
+            let report = FinalReviewReport {
+                repo: options.repo_name.clone(),
+                pr_number: pr.number,
+                pr_title: pr.title.clone(),
+                provider: provider.kind().as_str().to_string(),
+                worktree_path: worktree.path.display().to_string(),
+                run_artifact_dir: String::new(),
+                executive_summary: draft.executive_summary,
+                summary_findings,
+                inline_comments,
+                checks_summary,
+                per_file: file_reviews,
+                checks,
+                notes: draft.notes,
+            };
+            step.done(format!(
+                "{} summary findings, {} inline comments",
+                summary_count, comment_count
+            ));
+            Ok(report)
+        }
+        Err(error) => {
+            step.fail(error.to_string());
+            Err(error)
+        }
+    }
+}
+
+fn validate_file_review(job: &FileReviewJob, review: &FileReviewDraft) -> Result<()> {
+    anyhow::ensure!(
+        !review.summary.trim().is_empty(),
+        "file review for {} returned an empty summary",
+        job.file
+    );
+    anyhow::ensure!(
+        review.file.trim() == job.file,
+        "file review returned file `{}` but expected `{}`",
+        review.file,
+        job.file
+    );
+
+    for (index, finding) in review.findings.iter().enumerate() {
+        anyhow::ensure!(
+            !finding.file.trim().is_empty(),
+            "file review finding {} for {} is missing a file",
+            index + 1,
+            job.file
+        );
+        anyhow::ensure!(
+            !finding.title.trim().is_empty(),
+            "file review finding {} for {} is missing a title",
+            index + 1,
+            job.file
+        );
+    }
+
+    for (index, comment) in review.inline_comments.iter().enumerate() {
+        anyhow::ensure!(
+            !comment.file.trim().is_empty(),
+            "inline comment {} for {} is missing a file",
+            index + 1,
+            job.file
+        );
+        anyhow::ensure!(
+            !comment.title.trim().is_empty(),
+            "inline comment {} for {} is missing a title",
+            index + 1,
+            job.file
+        );
+        anyhow::ensure!(
+            !comment.body.trim().is_empty(),
+            "inline comment {} for {} is missing a body",
+            index + 1,
+            job.file
+        );
+    }
+
+    Ok(())
+}
+
 fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
     anyhow::ensure!(
         plan.checks.len() >= 5,
@@ -690,23 +607,43 @@ fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
     Ok(())
 }
 
-fn validate_build_execution(result: &BuildExecution) -> Result<()> {
+fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
     anyhow::ensure!(
-        matches!(result.status.as_str(), "passed" | "failed" | "skipped"),
-        "build phase returned unsupported status `{}`",
-        result.status
+        !draft.executive_summary.trim().is_empty(),
+        "final review returned an empty executive summary"
     );
-    anyhow::ensure!(
-        !result.summary.trim().is_empty(),
-        "build phase returned an empty summary"
-    );
-    if result.status != "skipped" {
+
+    for (index, finding) in draft.summary_findings.iter().enumerate() {
         anyhow::ensure!(
-            !result.commands_run.is_empty(),
-            "build phase must report at least one command when status is {}",
-            result.status
+            !finding.file.trim().is_empty(),
+            "summary finding {} is missing a file",
+            index + 1
+        );
+        anyhow::ensure!(
+            !finding.title.trim().is_empty(),
+            "summary finding {} is missing a title",
+            index + 1
         );
     }
+
+    for (index, comment) in draft.inline_comments.iter().enumerate() {
+        anyhow::ensure!(
+            !comment.file.trim().is_empty(),
+            "final inline comment {} is missing a file",
+            index + 1
+        );
+        anyhow::ensure!(
+            !comment.title.trim().is_empty(),
+            "final inline comment {} is missing a title",
+            index + 1
+        );
+        anyhow::ensure!(
+            !comment.body.trim().is_empty(),
+            "final inline comment {} is missing a body",
+            index + 1
+        );
+    }
+
     Ok(())
 }
 
@@ -724,7 +661,7 @@ where
     invoke_typed(provider, cwd, label, prompt).await
 }
 
-fn build_current_file_prompt(
+fn build_file_review_prompt(
     pr: &PullRequestDetails,
     job: &FileReviewJob,
     worktree_path: &PathBuf,
@@ -732,20 +669,22 @@ fn build_current_file_prompt(
 ) -> String {
     format!(
         "You are reviewing PR #{pr_number} ({pr_title}) in repo {repo_url}.\n\
-         Focus only on file `{file}`.\n\n\
+         Starting from this file `{file}`, can you review this file, but feel free to look at other files to ensure the changes in this file are good.\n\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          File change stats: +{additions} / -{deletions}\n\n\
          User request:\n{user_request}\n\n\
-         Current diff excerpt:\n```diff\n{diff}\n```\n\n\
-         Instructions:\n\
-         - Inspect the worktree and any nearby code you need.\n\
+         Current diff excerpt for the starting file:\n```diff\n{diff}\n```\n\n\
+         Requirements:\n\
+         - Inspect any nearby or dependent files you need, but keep the review centered on the starting file.\n\
          - Report only substantive correctness, regression, reliability, or maintainability issues.\n\
          - Ignore style-only nits and duplicate observations.\n\
+         - Return at most 5 findings and at most 5 inline comments.\n\
+         - Inline comments should be line-anchored when possible. If exact lines are unclear, use a file-level comment with null line numbers.\n\
+         - Inline comments can mention another file only when it is directly necessary to explain why the starting file's change is wrong.\n\
          - Use priority 0 for release-blocking issues, 1 for major bugs, 2 for moderate issues, 3 for minor-but-actionable issues.\n\
-         - Keep source_refs specific to the file, symbols, or commands you inspected.\n\
-         - Return at most 5 findings.\n\
-         - If there is no meaningful issue, return an empty findings array.",
+         - Keep source_refs specific to the files, symbols, or commands you inspected.\n\
+         - If there is no meaningful issue, return empty findings and inline_comments arrays.",
         pr_number = pr.number,
         pr_title = pr.title,
         repo_url = pr.url,
@@ -759,193 +698,10 @@ fn build_current_file_prompt(
     )
 }
 
-fn build_commit_context_prompt(
-    pr: &PullRequestDetails,
-    job: &FileReviewJob,
-    commit: &HistoricalCommit,
-    worktree_path: &PathBuf,
-    user_request: Option<&str>,
-) -> String {
-    format!(
-        "You are a historical context sub-reviewer for PR #{pr_number} ({pr_title}).\n\
-         File under review: `{file}`\n\
-         Worktree path: {worktree}\n\n\
-         User request:\n{user_request}\n\n\
-         Current PR diff excerpt:\n```diff\n{current_diff}\n```\n\n\
-         Historical commit touching the same file:\n\
-         SHA: {sha}\n\
-         Title: {title}\n\
-         Timestamp: {unix_time}\n\
-         Patch excerpt:\n```diff\n{patch}\n```\n\n\
-         Task:\n\
-         - Compare the historical change to the current PR.\n\
-         - Extract lessons, regressions, or edge cases that are plausibly relevant now.\n\
-         - Candidate findings must be grounded in the current PR, not just the old commit.\n\
-         - Return zero findings if the historical commit is not useful context.",
-        pr_number = pr.number,
-        pr_title = pr.title,
-        file = job.file,
-        worktree = worktree_path.display(),
-        user_request = render_user_request(user_request),
-        current_diff = job.diff_excerpt,
-        sha = commit.sha,
-        title = commit.title,
-        unix_time = commit.unix_time,
-        patch = commit.patch_excerpt
-    )
-}
-
-fn build_pr_context_prompt(
-    pr: &PullRequestDetails,
-    job: &FileReviewJob,
-    prior_pr: &HistoricalPr,
-    worktree_path: &PathBuf,
-    user_request: Option<&str>,
-) -> String {
-    format!(
-        "You are a historical context sub-reviewer for PR #{pr_number} ({pr_title}).\n\
-         File under review: `{file}`\n\
-         Worktree path: {worktree}\n\n\
-         User request:\n{user_request}\n\n\
-         Current PR diff excerpt:\n```diff\n{current_diff}\n```\n\n\
-         Prior merged PR touching the same file:\n\
-         Number: #{prior_number}\n\
-         Title: {prior_title}\n\
-         URL: {prior_url}\n\
-         Merged at: {merged_at}\n\
-         Body excerpt:\n{body_excerpt}\n\n\
-         Diff excerpt:\n```diff\n{prior_diff}\n```\n\n\
-         Task:\n\
-         - Use this prior PR as historical context only.\n\
-         - Surface candidate findings only if the prior PR exposes a likely bug, regression pattern, or overlooked invariant in the current PR.\n\
-         - Return zero findings when the historical PR is not relevant.",
-        pr_number = pr.number,
-        pr_title = pr.title,
-        file = job.file,
-        worktree = worktree_path.display(),
-        user_request = render_user_request(user_request),
-        current_diff = job.diff_excerpt,
-        prior_number = prior_pr.number,
-        prior_title = prior_pr.title,
-        prior_url = prior_pr.url,
-        merged_at = prior_pr.merged_at,
-        body_excerpt = prior_pr.body_excerpt,
-        prior_diff = prior_pr.diff_excerpt
-    )
-}
-
-fn build_file_aggregate_prompt(
-    pr: &PullRequestDetails,
-    job: &FileReviewJob,
-    base_review: &FileReviewDraft,
-    context_reviews: &[ContextReviewDraft],
-    user_request: Option<&str>,
-) -> String {
-    format!(
-        "You are the file-level aggregation reviewer for PR #{pr_number} ({pr_title}).\n\
-         Consolidate feedback for file `{file}`.\n\n\
-         User request:\n{user_request}\n\n\
-         Current file review:\n{base_review}\n\n\
-         Historical context reviews:\n{context_reviews}\n\n\
-         Instructions:\n\
-         - Merge duplicates.\n\
-         - Reject weak or speculative findings.\n\
-         - Preserve only findings that would matter in a serious code review.\n\
-         - Return at most 5 ranked findings for this file.\n\
-         - Put rejected or de-prioritized ideas in discarded_notes.",
-        pr_number = pr.number,
-        pr_title = pr.title,
-        file = job.file,
-        user_request = render_user_request(user_request),
-        base_review = serde_json::to_string_pretty(base_review).unwrap_or_default(),
-        context_reviews = serde_json::to_string_pretty(context_reviews).unwrap_or_default()
-    )
-}
-
-fn build_final_report_prompt(
-    options: &ReviewOptions,
-    pr: &PullRequestDetails,
-    aggregates: &[FileAggregate],
-    worktree: &Worktree,
-) -> String {
-    format!(
-        "You are the final PR review aggregator.\n\
-         Repo: {repo}\n\
-         PR: #{pr_number} {pr_title}\n\
-         URL: {pr_url}\n\
-         Worktree: {worktree}\n\
-         Provider: {provider}\n\n\
-         User request:\n{user_request}\n\n\
-         File-level aggregated reviews:\n{aggregates}\n\n\
-         Instructions:\n\
-         - Rank findings across the whole PR.\n\
-         - Deduplicate cross-file variants of the same issue.\n\
-         - Keep only high-signal findings that a reviewer should actually raise.\n\
-         - Return an executive summary, at most 12 ranked findings, and concise notes about coverage gaps if any.\n\
-         - If there are no strong findings, say so plainly.",
-        repo = options.repo_name,
-        pr_number = pr.number,
-        pr_title = pr.title,
-        pr_url = pr.url,
-        worktree = worktree.path.display(),
-        provider = "delegated-subprocess",
-        user_request = render_user_request(options.user_request.as_deref()),
-        aggregates = serde_json::to_string_pretty(aggregates).unwrap_or_default()
-    )
-}
-
-fn build_repo_prompt(
-    options: &ReviewOptions,
-    pr: &PullRequestDetails,
-    worktree: &Worktree,
-) -> String {
-    let changed_files = pr
-        .files
-        .iter()
-        .map(|file| {
-            format!(
-                "- {} (+{} / -{})",
-                file.path, file.additions, file.deletions
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "You are the repo build phase agent for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
-         Worktree path: {worktree}\n\
-         Base branch: {base}\n\
-         PR URL: {pr_url}\n\n\
-         User request:\n{user_request}\n\n\
-         Changed files:\n{changed_files}\n\n\
-         Task:\n\
-         - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built or prepared.\n\
-         - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
-         - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
-         - Keep the run non-interactive.\n\
-         - If the build fails, stop after enough investigation to explain the blocker clearly.\n\
-         - If there is genuinely no usable build guidance in the reviewer instructions, return status `skipped` with a concrete explanation.\n\n\
-         Return requirements:\n\
-         - status must be one of: passed, failed, skipped\n\
-         - commands_run must contain the exact shell commands you actually executed, in order\n\
-         - summary should be a short plain-English result\n\
-         - stdout_excerpt and stderr_excerpt should contain only the most relevant output excerpts\n\
-         - notes should capture blockers, environment assumptions, or follow-up actions",
-        pr_number = pr.number,
-        pr_title = pr.title,
-        repo = options.repo_name,
-        worktree = worktree.path.display(),
-        base = pr.base_ref_name,
-        pr_url = pr.url,
-        user_request = render_user_request(options.user_request.as_deref()),
-        changed_files = changed_files
-    )
-}
-
 fn build_check_plan_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
-    report: &FinalReviewReport,
+    file_reviews: &[FileReviewDraft],
     worktree: &Worktree,
 ) -> String {
     let changed_files = pr
@@ -972,23 +728,22 @@ fn build_check_plan_prompt(
     };
 
     format!(
-        "You are planning a post-review checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+        "You are planning the checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\n\
          User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Changed test-like files:\n{changed_test_files}\n\n\
-         Ranked findings:\n{findings}\n\n\
-         Per-file summaries:\n{per_file}\n\n\
+         Per-file review results:\n{file_reviews}\n\n\
          Requirements:\n\
          - Return at least 5 checks.\n\
          - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
          - Use repo-specific guidance from the global reviewer instructions when available, especially for build/test commands.\n\
-         - Prefer targeted checks first, then broader build/test or lint validation where useful.\n\
+         - Prefer targeted checks first, then broader validation where useful.\n\
          - Avoid duplicate commands.\n\
          - Every check must include a clear rationale and the expected signal to inspect.\n\
-         - Related findings should cite finding titles or file paths, not vague references.",
+         - Related findings should cite finding titles, inline comment titles, or file paths, not vague references.",
         pr_number = pr.number,
         pr_title = pr.title,
         repo = options.repo_name,
@@ -997,8 +752,43 @@ fn build_check_plan_prompt(
         user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files,
         changed_test_files = changed_test_files,
-        findings = serde_json::to_string_pretty(&report.ranked_findings).unwrap_or_default(),
-        per_file = serde_json::to_string_pretty(&report.per_file).unwrap_or_default()
+        file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default()
+    )
+}
+
+fn build_final_review_prompt(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    file_reviews: &[FileReviewDraft],
+    checks: &[CheckExecution],
+    worktree: &Worktree,
+) -> String {
+    format!(
+        "You are writing the final PR review.\n\
+         Repo: {repo}\n\
+         PR: #{pr_number} {pr_title}\n\
+         URL: {pr_url}\n\
+         Worktree: {worktree}\n\
+         Provider: {provider}\n\n\
+         User request:\n{user_request}\n\n\
+         Per-file reviews:\n{file_reviews}\n\n\
+         Executed checks:\n{checks}\n\n\
+         Requirements:\n\
+         - Write a concise executive summary of the real review outcome after considering the checks.\n\
+         - Return at most 10 summary findings.\n\
+         - Return all inline comments that should actually be left on the PR, deduplicated and filtered against the check results.\n\
+         - Prefer line-anchored inline comments when possible. If an issue is real but cannot be tied to an exact line, use a file-level comment with null line numbers.\n\
+         - Do not keep speculative comments that were weakened or disproved by the checks.\n\
+         - Notes should capture coverage gaps, unresolved uncertainty, or why potentially interesting issues were dropped.",
+        repo = options.repo_name,
+        pr_number = pr.number,
+        pr_title = pr.title,
+        pr_url = pr.url,
+        worktree = worktree.path.display(),
+        provider = "delegated-subprocess",
+        user_request = render_user_request(options.user_request.as_deref()),
+        file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default(),
+        checks = serde_json::to_string_pretty(checks).unwrap_or_default()
     )
 }
 
@@ -1016,51 +806,11 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
     out.push_str(report.executive_summary.trim());
     out.push_str("\n\n");
 
-    out.push_str("## Build\n\n");
-    match &report.build {
-        Some(build) => {
-            out.push_str(&format!(
-                "Status: **{}**\n\n{}\n\n",
-                build.status.to_ascii_uppercase(),
-                build.summary.trim()
-            ));
-            if !build.commands_run.is_empty() {
-                out.push_str("Commands run:\n");
-                for (index, command) in build.commands_run.iter().enumerate() {
-                    out.push_str(&format!("{}. `{}`\n", index + 1, command));
-                }
-                out.push('\n');
-            }
-            if !build.stdout_excerpt.trim().is_empty() {
-                out.push_str("Stdout excerpt:\n");
-                out.push_str("```text\n");
-                out.push_str(build.stdout_excerpt.trim());
-                out.push_str("\n```\n\n");
-            }
-            if !build.stderr_excerpt.trim().is_empty() {
-                out.push_str("Stderr excerpt:\n");
-                out.push_str("```text\n");
-                out.push_str(build.stderr_excerpt.trim());
-                out.push_str("\n```\n\n");
-            }
-            if !build.notes.is_empty() {
-                out.push_str("Build notes:\n");
-                for note in &build.notes {
-                    out.push_str(&format!("- {}\n", note.trim()));
-                }
-                out.push('\n');
-            }
-        }
-        None => {
-            out.push_str("Build phase did not run.\n\n");
-        }
-    }
-
-    out.push_str("## Ranked Findings\n\n");
-    if report.ranked_findings.is_empty() {
-        out.push_str("No high-confidence findings.\n\n");
+    out.push_str("## Summary Findings\n\n");
+    if report.summary_findings.is_empty() {
+        out.push_str("No high-confidence summary findings.\n\n");
     } else {
-        for (index, finding) in report.ranked_findings.iter().enumerate() {
+        for (index, finding) in report.summary_findings.iter().enumerate() {
             out.push_str(&format!(
                 "{}. [P{}] `{}`: {}\n",
                 index + 1,
@@ -1085,6 +835,28 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
             }
             out.push('\n');
         }
+    }
+
+    out.push_str("## Inline Comments\n\n");
+    if report.inline_comments.is_empty() {
+        out.push_str("No inline comments.\n\n");
+    } else {
+        let mut current_file = None::<&str>;
+        for comment in &report.inline_comments {
+            if current_file != Some(comment.file.as_str()) {
+                current_file = Some(comment.file.as_str());
+                out.push_str(&format!("### `{}`\n\n", comment.file));
+            }
+            out.push_str(&format!(
+                "- {} [P{}] {} (confidence {:.2})\n",
+                line_range_label(comment),
+                comment.priority,
+                comment.title,
+                comment.confidence
+            ));
+            out.push_str(&format!("  {}\n", comment.body.trim()));
+        }
+        out.push('\n');
     }
 
     out.push_str("## Checks\n\n");
@@ -1132,19 +904,35 @@ pub fn render_markdown(report: &FinalReviewReport) -> String {
         }
     }
 
-    out.push_str("## Per-File Summaries\n\n");
-    for aggregate in &report.per_file {
-        out.push_str(&format!("### `{}`\n\n", aggregate.file));
-        out.push_str(aggregate.summary.trim());
+    out.push_str("## Per-File Reviews\n\n");
+    for review in &report.per_file {
+        out.push_str(&format!("### `{}`\n\n", review.file));
+        out.push_str(review.summary.trim());
         out.push_str("\n\n");
-        if aggregate.findings.is_empty() {
+        if review.findings.is_empty() {
             out.push_str("No retained findings.\n\n");
         } else {
-            for finding in &aggregate.findings {
+            out.push_str("Findings:\n");
+            for finding in &review.findings {
                 out.push_str(&format!(
                     "- [P{}] {} (confidence {:.2})\n",
                     finding.priority, finding.title, finding.confidence
                 ));
+            }
+            out.push('\n');
+        }
+        if review.inline_comments.is_empty() {
+            out.push_str("No inline comments proposed for this starting file.\n\n");
+        } else {
+            out.push_str("Inline comments proposed from this starting file:\n");
+            for comment in &review.inline_comments {
+                out.push_str(&format!(
+                    "- `{}` {} [P{}]\n",
+                    comment.file,
+                    line_range_label(comment),
+                    comment.priority
+                ));
+                out.push_str(&format!("  {}\n", comment.title.trim()));
             }
             out.push('\n');
         }
@@ -1178,15 +966,6 @@ fn excerpt(value: &str, max_chars: usize) -> String {
         .collect();
 
     format!("{head}\n...\n{tail}")
-}
-
-fn short_sha(sha: &str) -> &str {
-    let end = sha.len().min(8);
-    &sha[..end]
-}
-
-fn planned_invocations_for_job(job: &FileReviewJob) -> usize {
-    2 + job.recent_commits.len() + job.recent_prs.len()
 }
 
 fn summarize_checks(plan_summary: &str, checks: &[CheckExecution]) -> String {
@@ -1231,5 +1010,13 @@ fn render_user_request(user_request: Option<&str>) -> String {
     match user_request {
         Some(value) if !value.trim().is_empty() => value.trim().to_string(),
         _ => "No additional user request provided.".to_string(),
+    }
+}
+
+fn line_range_label(comment: &InlineComment) -> String {
+    match (comment.start_line, comment.end_line) {
+        (Some(start), Some(end)) if end > start => format!("L{start}-L{end}"),
+        (Some(start), _) => format!("L{start}"),
+        _ => "file-level".to_string(),
     }
 }

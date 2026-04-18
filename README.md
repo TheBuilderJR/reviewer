@@ -7,18 +7,13 @@ Rust CLI for PR review orchestration using either `codex` or `claude` as the rev
 For a GitHub PR, the harness:
 
 1. Fetches the PR and creates a detached git worktree.
-2. Collects changed files plus recent commits and merged PRs touching each file.
-3. Shells out to the selected provider for:
-   - one current-state reviewer per changed file
-   - one historical-context reviewer per recent commit
-   - one historical-context reviewer per recent PR
-   - one file-level aggregation pass
-   - one final PR-level aggregation pass
-4. Produces a ranked review report in Markdown and optional JSON.
-5. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
-6. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
-7. Streams live progress to stderr for major phases and per-agent start/finish status.
-8. Adds a final `checks` phase that plans at least 5 sanity checks, then executes them sequentially in the PR worktree.
+2. Prepares one review job per changed file.
+3. Shells out to the selected provider for one reviewer per changed file, with each reviewer starting from that file but allowed to inspect nearby code in other files.
+4. Uses those file reviews to plan at least 5 checks, then runs those checks sequentially in the PR worktree.
+5. Writes a final review with an executive summary and inline comments like a real code review.
+6. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
+7. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
+8. Streams live progress to stderr for major phases and per-agent start/finish status.
 
 The harness assumes the selected CLI is already authenticated.
 
@@ -66,9 +61,6 @@ Optional controls:
 - `--repo owner/name` to skip repo autodetection or pair a numeric `--pr` with a repo when you are not in the target checkout
 - `--model <name>` to pass a provider-specific model name through to the CLI
 - `--extra-args "<shell-style flags>"` to pass provider-specific flags straight through to `codex` or `claude`
-- `--max-commits-per-file <n>`
-- `--max-prs-per-file <n>`
-- `--pr-scan-limit <n>`
 - `--parallelism <n>`
 - `--agent-timeout-secs <n>`
 - `--check-timeout-secs <n>` to control the timeout for each sequential shell check
@@ -82,9 +74,9 @@ Optional controls:
 
 ## Notes
 
-- The current implementation gathers prior PR context by scanning recent merged PRs and filtering to file matches. That is intentionally simple and may be slow on large repos.
 - Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
-- The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in both the final Markdown and the `/tmp/run_<uuid>` artifacts.
+- `~/.reviewer.md` still matters: every file reviewer, the checks planner, and the final review writer see that shared guidance.
+- Build or broader validation now happens through the planned checks rather than as a separate pre-review phase.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
 - Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.
