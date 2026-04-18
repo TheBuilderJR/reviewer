@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -67,6 +67,33 @@ pub async fn resolve_repo_name(repo_path: &Path) -> Result<String> {
     let value: GhRepoView =
         serde_json::from_str(&output.stdout).context("failed to parse gh repo view output")?;
     Ok(value.name_with_owner)
+}
+
+pub async fn ensure_repo_checkout(repo: &str, target_dir: &Path) -> Result<PathBuf> {
+    if target_dir.exists() {
+        return Ok(target_dir.to_path_buf());
+    }
+
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid clone target {}", target_dir.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed creating {}", parent.display()))?;
+
+    let args = vec![
+        "repo".to_string(),
+        "clone".to_string(),
+        repo.to_string(),
+        target_dir.display().to_string(),
+        "--".to_string(),
+        "--filter=blob:none".to_string(),
+    ];
+    run_command("gh", &args, parent, GH_TIMEOUT_SECS)
+        .await
+        .with_context(|| format!("failed to clone {repo} into {}", target_dir.display()))?;
+
+    Ok(target_dir.to_path_buf())
 }
 
 pub async fn fetch_pr_details(

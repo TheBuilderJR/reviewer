@@ -26,6 +26,7 @@ pub struct ReviewOptions {
     pub pr_number: u64,
     pub repo_name: String,
     pub repo_path: PathBuf,
+    pub user_request: Option<String>,
     pub max_commits_per_file: usize,
     pub max_prs_per_file: usize,
     pub pr_scan_limit: usize,
@@ -288,8 +289,18 @@ async fn review_files(
         let progress = progress.clone();
         let worktree_path = worktree.path.clone();
         let pr = pr.clone();
+        let user_request = options.user_request.clone();
         tasks.push(tokio::spawn(async move {
-            review_single_file(&semaphore, provider, &worktree_path, &pr, job, progress).await
+            review_single_file(
+                &semaphore,
+                provider,
+                &worktree_path,
+                &pr,
+                job,
+                user_request.as_deref(),
+                progress,
+            )
+            .await
         }));
     }
 
@@ -312,6 +323,7 @@ async fn review_single_file(
     worktree_path: &PathBuf,
     pr: &PullRequestDetails,
     job: FileReviewJob,
+    user_request: Option<&str>,
     progress: Arc<ProgressReporter>,
 ) -> Result<FileAggregate> {
     progress.info(
@@ -323,7 +335,7 @@ async fn review_single_file(
             job.recent_prs.len()
         ),
     );
-    let base_prompt = build_current_file_prompt(pr, &job, worktree_path);
+    let base_prompt = build_current_file_prompt(pr, &job, worktree_path, user_request);
     let base_review: FileReviewDraft = invoke_with_semaphore(
         semaphore,
         provider.as_ref(),
@@ -336,7 +348,7 @@ async fn review_single_file(
     let mut context_tasks = Vec::new();
 
     for commit in job.recent_commits.clone() {
-        let prompt = build_commit_context_prompt(pr, &job, &commit, worktree_path);
+        let prompt = build_commit_context_prompt(pr, &job, &commit, worktree_path, user_request);
         let label = format!("context commit {} {}", short_sha(&commit.sha), job.file);
         let semaphore = semaphore.clone();
         let provider = provider.clone();
@@ -354,7 +366,7 @@ async fn review_single_file(
     }
 
     for prior_pr in job.recent_prs.clone() {
-        let prompt = build_pr_context_prompt(pr, &job, &prior_pr, worktree_path);
+        let prompt = build_pr_context_prompt(pr, &job, &prior_pr, worktree_path, user_request);
         let label = format!("context pr {} {}", prior_pr.number, job.file);
         let semaphore = semaphore.clone();
         let provider = provider.clone();
@@ -376,7 +388,8 @@ async fn review_single_file(
         context_reviews.push(task.context("context review task panicked")??);
     }
 
-    let aggregate_prompt = build_file_aggregate_prompt(pr, &job, &base_review, &context_reviews);
+    let aggregate_prompt =
+        build_file_aggregate_prompt(pr, &job, &base_review, &context_reviews, user_request);
     invoke_with_semaphore::<FileAggregate>(
         semaphore,
         provider.as_ref(),
@@ -648,6 +661,7 @@ fn build_current_file_prompt(
     pr: &PullRequestDetails,
     job: &FileReviewJob,
     worktree_path: &PathBuf,
+    user_request: Option<&str>,
 ) -> String {
     format!(
         "You are reviewing PR #{pr_number} ({pr_title}) in repo {repo_url}.\n\
@@ -655,6 +669,7 @@ fn build_current_file_prompt(
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          File change stats: +{additions} / -{deletions}\n\n\
+         User request:\n{user_request}\n\n\
          Current diff excerpt:\n```diff\n{diff}\n```\n\n\
          Instructions:\n\
          - Inspect the worktree and any nearby code you need.\n\
@@ -672,6 +687,7 @@ fn build_current_file_prompt(
         base = pr.base_ref_name,
         additions = job.additions,
         deletions = job.deletions,
+        user_request = render_user_request(user_request),
         diff = job.diff_excerpt
     )
 }
@@ -681,11 +697,13 @@ fn build_commit_context_prompt(
     job: &FileReviewJob,
     commit: &HistoricalCommit,
     worktree_path: &PathBuf,
+    user_request: Option<&str>,
 ) -> String {
     format!(
         "You are a historical context sub-reviewer for PR #{pr_number} ({pr_title}).\n\
          File under review: `{file}`\n\
          Worktree path: {worktree}\n\n\
+         User request:\n{user_request}\n\n\
          Current PR diff excerpt:\n```diff\n{current_diff}\n```\n\n\
          Historical commit touching the same file:\n\
          SHA: {sha}\n\
@@ -701,6 +719,7 @@ fn build_commit_context_prompt(
         pr_title = pr.title,
         file = job.file,
         worktree = worktree_path.display(),
+        user_request = render_user_request(user_request),
         current_diff = job.diff_excerpt,
         sha = commit.sha,
         title = commit.title,
@@ -714,11 +733,13 @@ fn build_pr_context_prompt(
     job: &FileReviewJob,
     prior_pr: &HistoricalPr,
     worktree_path: &PathBuf,
+    user_request: Option<&str>,
 ) -> String {
     format!(
         "You are a historical context sub-reviewer for PR #{pr_number} ({pr_title}).\n\
          File under review: `{file}`\n\
          Worktree path: {worktree}\n\n\
+         User request:\n{user_request}\n\n\
          Current PR diff excerpt:\n```diff\n{current_diff}\n```\n\n\
          Prior merged PR touching the same file:\n\
          Number: #{prior_number}\n\
@@ -735,6 +756,7 @@ fn build_pr_context_prompt(
         pr_title = pr.title,
         file = job.file,
         worktree = worktree_path.display(),
+        user_request = render_user_request(user_request),
         current_diff = job.diff_excerpt,
         prior_number = prior_pr.number,
         prior_title = prior_pr.title,
@@ -750,10 +772,12 @@ fn build_file_aggregate_prompt(
     job: &FileReviewJob,
     base_review: &FileReviewDraft,
     context_reviews: &[ContextReviewDraft],
+    user_request: Option<&str>,
 ) -> String {
     format!(
         "You are the file-level aggregation reviewer for PR #{pr_number} ({pr_title}).\n\
          Consolidate feedback for file `{file}`.\n\n\
+         User request:\n{user_request}\n\n\
          Current file review:\n{base_review}\n\n\
          Historical context reviews:\n{context_reviews}\n\n\
          Instructions:\n\
@@ -765,6 +789,7 @@ fn build_file_aggregate_prompt(
         pr_number = pr.number,
         pr_title = pr.title,
         file = job.file,
+        user_request = render_user_request(user_request),
         base_review = serde_json::to_string_pretty(base_review).unwrap_or_default(),
         context_reviews = serde_json::to_string_pretty(context_reviews).unwrap_or_default()
     )
@@ -783,6 +808,7 @@ fn build_final_report_prompt(
          URL: {pr_url}\n\
          Worktree: {worktree}\n\
          Provider: {provider}\n\n\
+         User request:\n{user_request}\n\n\
          File-level aggregated reviews:\n{aggregates}\n\n\
          Instructions:\n\
          - Rank findings across the whole PR.\n\
@@ -796,6 +822,7 @@ fn build_final_report_prompt(
         pr_url = pr.url,
         worktree = worktree.path.display(),
         provider = "delegated-subprocess",
+        user_request = render_user_request(options.user_request.as_deref()),
         aggregates = serde_json::to_string_pretty(aggregates).unwrap_or_default()
     )
 }
@@ -833,6 +860,7 @@ fn build_check_plan_prompt(
         "You are planning a post-review checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\n\
+         User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Changed test-like files:\n{changed_test_files}\n\n\
          Ranked findings:\n{findings}\n\n\
@@ -851,6 +879,7 @@ fn build_check_plan_prompt(
         repo = options.repo_name,
         worktree = worktree.path.display(),
         base = pr.base_ref_name,
+        user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files,
         changed_test_files = changed_test_files,
         findings = serde_json::to_string_pretty(&report.ranked_findings).unwrap_or_default(),
@@ -1041,4 +1070,11 @@ fn looks_like_test_file(path: &str) -> bool {
         || lowered.ends_with(".spec.js")
         || lowered.ends_with(".test.ts")
         || lowered.ends_with(".test.js")
+}
+
+fn render_user_request(user_request: Option<&str>) -> String {
+    match user_request {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => "No additional user request provided.".to_string(),
+    }
 }

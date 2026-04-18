@@ -33,6 +33,18 @@ pub async fn fetch_pr_head_ref(repo_path: &Path, pr_number: u64) -> Result<Strin
     Ok(review_ref)
 }
 
+pub async fn is_git_repo(repo_path: &Path) -> bool {
+    let args = vec![
+        "-C".to_string(),
+        repo_path.display().to_string(),
+        "rev-parse".to_string(),
+        "--is-inside-work-tree".to_string(),
+    ];
+    run_command("git", &args, repo_path, GIT_TIMEOUT_SECS)
+        .await
+        .is_ok()
+}
+
 pub async fn create_pr_worktree(
     repo_path: &Path,
     pr_number: u64,

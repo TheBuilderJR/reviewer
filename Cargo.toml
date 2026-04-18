@@ -1,6 +1,6 @@
 [package]
 name = "reviewer"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Transparent PR review orchestration with Codex or Claude subprocesses"
 repository = "https://github.com/TheBuilderJR/reviewer"
@@ -10,6 +10,7 @@ anyhow = "1.0.100"
 async-trait = "0.1.89"
 clap = { version = "4.5.50", features = ["derive"] }
 futures = "0.3.31"
+regex = "1.12.2"
 schemars = { version = "1.1.0", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

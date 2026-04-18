@@ -35,8 +35,7 @@ The harness assumes the selected CLI is already authenticated.
 ```bash
 cargo run -- \
   --provider codex \
-  --repo-path /path/to/target/repo \
-  --pr 123 \
+  --pr https://github.com/pytorch/pytorch/pull/180747 \
   --output-markdown /tmp/pr-123-review.md \
   --output-json /tmp/pr-123-review.json
 ```
@@ -48,8 +47,7 @@ Claude works the same way:
 ```bash
 cargo run -- \
   --provider claude \
-  --repo-path /path/to/target/repo \
-  --pr 123
+  --pr https://github.com/pytorch/pytorch/pull/180747
 ```
 
 You can also pass through provider-specific flags when the local CLI needs them:
@@ -58,13 +56,14 @@ You can also pass through provider-specific flags when the local CLI needs them:
 cargo run -- \
   --provider claude \
   --extra-args "--dangerously-enable-internet-mode --dangerously-skip-permissions" \
-  --repo-path /path/to/target/repo \
-  --pr 123
+  --pr https://github.com/pytorch/pytorch/pull/180747
 ```
+
+`--pr` accepts either a plain PR number like `180747` or a full GitHub PR URL. If you are not already inside the target repo checkout and you pass a full URL, reviewer will clone the repo under `/tmp/reviewer-repos/...` automatically and run from there.
 
 Optional controls:
 
-- `--repo owner/name` to skip repo autodetection through `gh repo view`
+- `--repo owner/name` to skip repo autodetection or pair a numeric `--pr` with a repo when you are not in the target checkout
 - `--model <name>` to pass a provider-specific model name through to the CLI
 - `--extra-args "<shell-style flags>"` to pass provider-specific flags straight through to `codex` or `claude`
 - `--max-commits-per-file <n>`

@@ -2,6 +2,7 @@ mod git;
 mod github;
 mod progress;
 mod provider;
+mod request;
 mod review;
 mod runlog;
 mod shell;
@@ -13,8 +14,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
+use git::is_git_repo;
 use progress::ProgressReporter;
 use provider::{PromptPreamble, Provider, build_provider};
+use request::{RequestSpec, resolve_request};
 use review::{ReviewOptions, render_markdown, run_review};
 use runlog::RunLogger;
 
@@ -43,10 +46,10 @@ struct Args {
     provider: ProviderKind,
 
     #[arg(long)]
-    pr: u64,
+    pr: String,
 
-    #[arg(long, default_value = ".")]
-    repo_path: PathBuf,
+    #[arg(long)]
+    repo_path: Option<PathBuf>,
 
     #[arg(long)]
     repo: Option<String>,
@@ -89,13 +92,12 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let progress = Arc::new(ProgressReporter::new());
-    let repo_path = args
-        .repo_path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve repo path {}", args.repo_path.display()))?;
     let prompt_preamble = load_prompt_preamble().await?;
     let run_logger = Arc::new(RunLogger::create().await?);
     let extra_args = parse_extra_args(args.extra_args.as_deref())?;
+    let request = resolve_request(&args.pr, args.repo.as_deref())?;
+    let repo_path =
+        resolve_repo_checkout(args.repo_path.clone(), &request, progress.clone()).await?;
 
     progress.info(
         "run",
@@ -138,15 +140,16 @@ async fn main() -> Result<()> {
         extra_args,
     );
 
-    let repo_name = match &args.repo {
+    let repo_name = match &request.repo_name {
         Some(repo) => repo.clone(),
         None => github::resolve_repo_name(&repo_path).await?,
     };
 
     let options = ReviewOptions {
-        pr_number: args.pr,
+        pr_number: request.pr_number,
         repo_name,
         repo_path,
+        user_request: None,
         max_commits_per_file: args.max_commits_per_file,
         max_prs_per_file: args.max_prs_per_file,
         pr_scan_limit: args.pr_scan_limit,
@@ -234,4 +237,84 @@ fn parse_extra_args(value: Option<&str>) -> Result<Vec<String>> {
         }
         None => Ok(Vec::new()),
     }
+}
+
+async fn resolve_repo_checkout(
+    requested_repo_path: Option<PathBuf>,
+    request: &RequestSpec,
+    progress: Arc<ProgressReporter>,
+) -> Result<PathBuf> {
+    let explicit_path = match requested_repo_path {
+        Some(path) => Some(
+            path.canonicalize()
+                .with_context(|| format!("failed to resolve repo path {}", path.display()))?,
+        ),
+        None => None,
+    };
+
+    if let Some(path) = &explicit_path {
+        if !is_git_repo(path).await {
+            bail!(
+                "repo path {} is not a git checkout. Point --repo-path at a clone of the target repo or omit it and let reviewer clone the repo automatically.",
+                path.display()
+            );
+        }
+
+        if let Some(expected_repo) = &request.repo_name {
+            let actual_repo = github::resolve_repo_name(path)
+                .await
+                .with_context(|| format!("failed to resolve GitHub repo for {}", path.display()))?;
+            if actual_repo != *expected_repo {
+                bail!(
+                    "repo path {} points at {}, but the request targets {}. Use the matching checkout or omit --repo-path.",
+                    path.display(),
+                    actual_repo,
+                    expected_repo
+                );
+            }
+        }
+
+        progress.info(
+            "repo",
+            format!("using explicit checkout {}", path.display()),
+        );
+        return Ok(path.clone());
+    }
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    if is_git_repo(&cwd).await {
+        if let Some(expected_repo) = &request.repo_name {
+            if let Ok(actual_repo) = github::resolve_repo_name(&cwd).await {
+                if actual_repo == *expected_repo {
+                    let cwd = cwd
+                        .canonicalize()
+                        .with_context(|| format!("failed to resolve {}", cwd.display()))?;
+                    progress.info("repo", format!("using current checkout {}", cwd.display()));
+                    return Ok(cwd);
+                }
+            }
+        } else if let Ok(cwd) = cwd.canonicalize() {
+            progress.info("repo", format!("using current checkout {}", cwd.display()));
+            return Ok(cwd);
+        }
+    }
+
+    let repo_name = request.repo_name.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine which repository to review. Pass --repo owner/name, use a full GitHub PR URL with --pr, or run reviewer inside the target repo checkout."
+        )
+    })?;
+    let clone_dir = clone_dir_for_repo(repo_name);
+    let step = progress.begin_step(
+        "phase",
+        format!("materializing repo checkout for {}", repo_name),
+    );
+    let repo_path = github::ensure_repo_checkout(repo_name, &clone_dir).await?;
+    step.done(repo_path.display().to_string());
+    Ok(repo_path)
+}
+
+fn clone_dir_for_repo(repo_name: &str) -> PathBuf {
+    let sanitized = repo_name.replace('/', "__");
+    std::env::temp_dir().join("reviewer-repos").join(sanitized)
 }
