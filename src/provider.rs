@@ -31,7 +31,14 @@ impl ProviderKind {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
-    async fn invoke(&self, cwd: &Path, schema: &Value, prompt: &str, label: &str) -> Result<Value>;
+    async fn invoke(
+        &self,
+        cwd: &Path,
+        extra_dirs: &[std::path::PathBuf],
+        schema: &Value,
+        prompt: &str,
+        label: &str,
+    ) -> Result<Value>;
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +76,7 @@ pub fn build_provider(
 pub async fn invoke_typed<T>(
     provider: &dyn Provider,
     cwd: &Path,
+    extra_dirs: &[std::path::PathBuf],
     label: &str,
     prompt: &str,
 ) -> Result<T>
@@ -76,7 +84,7 @@ where
     T: DeserializeOwned + JsonSchema,
 {
     let schema = serde_json::to_value(schemars::schema_for!(T))?;
-    let value = provider.invoke(cwd, &schema, prompt, label).await?;
+    let value = provider.invoke(cwd, extra_dirs, &schema, prompt, label).await?;
     serde_json::from_value(value).with_context(|| {
         format!(
             "failed to deserialize {} response",
@@ -99,7 +107,14 @@ impl Provider for CodexProvider {
         ProviderKind::Codex
     }
 
-    async fn invoke(&self, cwd: &Path, schema: &Value, prompt: &str, label: &str) -> Result<Value> {
+    async fn invoke(
+        &self,
+        cwd: &Path,
+        _extra_dirs: &[std::path::PathBuf],
+        schema: &Value,
+        prompt: &str,
+        label: &str,
+    ) -> Result<Value> {
         let prompt = self.materialize_prompt(prompt);
         let temp = tempdir().context("failed to create temp dir for codex run")?;
         let schema_path = temp.path().join("schema.json");
@@ -226,7 +241,14 @@ impl Provider for ClaudeProvider {
         ProviderKind::Claude
     }
 
-    async fn invoke(&self, cwd: &Path, schema: &Value, prompt: &str, label: &str) -> Result<Value> {
+    async fn invoke(
+        &self,
+        cwd: &Path,
+        extra_dirs: &[std::path::PathBuf],
+        schema: &Value,
+        prompt: &str,
+        label: &str,
+    ) -> Result<Value> {
         let base_prompt = self.materialize_prompt(prompt);
         let mut args = self.extra_args.clone();
         args.extend(vec![
@@ -242,8 +264,19 @@ impl Provider for ClaudeProvider {
             cwd.display().to_string(),
             "--add-dir".to_string(),
             self.run_logger.root().display().to_string(),
-            "-".to_string(),
         ]);
+
+        for extra_dir in extra_dirs {
+            if extra_dir.as_path() == cwd || extra_dir.as_path() == self.run_logger.root() {
+                continue;
+            }
+            args.extend([
+                "--add-dir".to_string(),
+                extra_dir.display().to_string(),
+            ]);
+        }
+
+        args.push("-".to_string());
 
         if let Some(model) = &self.model {
             args.splice(

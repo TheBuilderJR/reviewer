@@ -26,6 +26,7 @@ pub struct ReviewOptions {
     pub pr_number: u64,
     pub repo_name: String,
     pub repo_path: PathBuf,
+    pub provider_cwd: PathBuf,
     pub user_request: Option<String>,
     pub parallelism: usize,
     pub keep_worktree: bool,
@@ -102,7 +103,7 @@ pub async fn run_review(
             execute_build_phase(&options, &pr, &worktree, provider.clone(), progress.clone())
                 .await?;
         let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
-        progress.set_agent_total(jobs.len() + 2);
+        progress.set_agent_total(jobs.len());
         let file_reviews = review_files(
             &options,
             &pr,
@@ -131,6 +132,7 @@ pub async fn run_review(
         )
         .await?;
         let checks_summary = summarize_checks(&check_plan.summary, &checks);
+        progress.set_agent_total(1);
         write_final_review(
             &options,
             &pr,
@@ -190,7 +192,8 @@ async fn execute_build_phase(
     let build_result: Result<BuildExecution> = async {
         let mut result: BuildExecution = invoke_typed(
             provider.as_ref(),
-            &worktree.path,
+            &options.provider_cwd,
+            &[worktree.path.clone()],
             &format!("build repo {}", pr.number),
             &prompt,
         )
@@ -291,6 +294,7 @@ async fn review_files(
         );
         let semaphore = semaphore.clone();
         let provider = provider.clone();
+        let provider_cwd = options.provider_cwd.clone();
         let worktree_path = worktree.path.clone();
         let pr = pr.clone();
         let user_request = options.user_request.clone();
@@ -298,6 +302,7 @@ async fn review_files(
             review_single_file(
                 &semaphore,
                 provider,
+                &provider_cwd,
                 &worktree_path,
                 &pr,
                 job,
@@ -324,16 +329,18 @@ async fn review_files(
 async fn review_single_file(
     semaphore: &Arc<Semaphore>,
     provider: Arc<dyn Provider>,
+    provider_cwd: &PathBuf,
     worktree_path: &PathBuf,
     pr: &PullRequestDetails,
     job: FileReviewJob,
     user_request: Option<&str>,
 ) -> Result<FileReviewDraft> {
-    let prompt = build_file_review_prompt(pr, &job, worktree_path, user_request);
+    let prompt = build_file_review_prompt(pr, &job, worktree_path, provider_cwd, user_request);
     let mut review: FileReviewDraft = invoke_with_semaphore(
         semaphore,
         provider.as_ref(),
-        worktree_path,
+        provider_cwd,
+        &[worktree_path.clone()],
         &format!("review {}", job.file),
         &prompt,
     )
@@ -353,11 +360,13 @@ async fn plan_checks(
     progress: Arc<ProgressReporter>,
 ) -> Result<CheckPlanDraft> {
     let step = progress.begin_step("phase", "planning checks".to_string());
+    progress.set_agent_total(1);
     let prompt = build_check_plan_prompt(options, pr, build, file_reviews, worktree);
     let plan_result: Result<CheckPlanDraft> = async {
         let plan: CheckPlanDraft = invoke_typed(
             provider.as_ref(),
-            &worktree.path,
+            &options.provider_cwd,
+            &[worktree.path.clone()],
             &format!("plan checks {}", pr.number),
             &prompt,
         )
@@ -535,7 +544,8 @@ async fn write_final_review(
     let draft_result: Result<FinalReviewDraft> = async {
         let mut draft: FinalReviewDraft = invoke_typed(
             provider.as_ref(),
-            &worktree.path,
+            &options.provider_cwd,
+            &[worktree.path.clone()],
             &format!("write final review {}", pr.number),
             &prompt,
         )
@@ -850,6 +860,7 @@ async fn invoke_with_semaphore<T>(
     semaphore: &Arc<Semaphore>,
     provider: &dyn Provider,
     cwd: &PathBuf,
+    extra_dirs: &[PathBuf],
     label: &str,
     prompt: &str,
 ) -> Result<T>
@@ -857,24 +868,27 @@ where
     T: serde::de::DeserializeOwned + schemars::JsonSchema,
 {
     let _permit = semaphore.acquire().await?;
-    invoke_typed(provider, cwd, label, prompt).await
+    invoke_typed(provider, cwd, extra_dirs, label, prompt).await
 }
 
 fn build_file_review_prompt(
     pr: &PullRequestDetails,
     job: &FileReviewJob,
     worktree_path: &PathBuf,
+    provider_cwd: &PathBuf,
     user_request: Option<&str>,
 ) -> String {
     format!(
         "You are reviewing PR #{pr_number} ({pr_title}) in repo {repo_url}.\n\
          Starting from this file `{file}`, can you review this file, but feel free to look at other files to ensure the changes in this file are good.\n\n\
+         Agent launch cwd: {provider_cwd}\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          File change stats: +{additions} / -{deletions}\n\n\
          User request:\n{user_request}\n\n\
          Current diff excerpt for the starting file:\n```diff\n{diff}\n```\n\n\
          Requirements:\n\
+         - The harness launched you from `{provider_cwd}`, but the PR snapshot lives at `{worktree}`. If you run commands or inspect files, operate on the worktree path, not the launch cwd.\n\
          - Inspect any nearby or dependent files you need, but keep the review centered on the starting file.\n\
          - Report only substantive correctness, regression, reliability, or maintainability issues.\n\
          - Ignore style-only nits and duplicate observations.\n\
@@ -893,6 +907,7 @@ fn build_file_review_prompt(
         pr_title = pr.title,
         repo_url = pr.url,
         file = job.file,
+        provider_cwd = provider_cwd.display(),
         worktree = worktree_path.display(),
         base = pr.base_ref_name,
         additions = job.additions,
@@ -921,12 +936,14 @@ fn build_repo_prompt(
 
     format!(
         "You are the repo build phase agent for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         Agent launch cwd: {provider_cwd}\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          PR URL: {pr_url}\n\n\
          User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Task:\n\
+         - You were launched from `{provider_cwd}`, but the PR snapshot lives at `{worktree}`. For any repo command, first `cd` into the worktree or otherwise target that path explicitly. Do not build from the launch cwd.\n\
          - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built, prepared, or bootstrapped.\n\
          - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
          - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
@@ -943,6 +960,7 @@ fn build_repo_prompt(
         pr_number = pr.number,
         pr_title = pr.title,
         repo = options.repo_name,
+        provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
         base = pr.base_ref_name,
         pr_url = pr.url,
@@ -983,6 +1001,7 @@ fn build_check_plan_prompt(
 
     format!(
         "You are planning the checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         Agent launch cwd: {provider_cwd}\n\
          Worktree path: {worktree}\n\
          Base branch: {base}\n\n\
          User request:\n{user_request}\n\n\
@@ -991,6 +1010,7 @@ fn build_check_plan_prompt(
          Build phase result:\n{build}\n\n\
          Per-file review results:\n{file_reviews}\n\n\
          Requirements:\n\
+         - If you inspect repo state, use the worktree path rather than the launch cwd.\n\
          - Return a compact JSON object with keys: `summary` and `checks`.\n\
          - Return at least 5 checks.\n\
          - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
@@ -1003,6 +1023,7 @@ fn build_check_plan_prompt(
         pr_number = pr.number,
         pr_title = pr.title,
         repo = options.repo_name,
+        provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
         base = pr.base_ref_name,
         user_request = render_user_request(options.user_request.as_deref()),
@@ -1026,6 +1047,7 @@ fn build_final_review_prompt(
          Repo: {repo}\n\
          PR: #{pr_number} {pr_title}\n\
          URL: {pr_url}\n\
+         Agent launch cwd: {provider_cwd}\n\
          Worktree: {worktree}\n\
          Provider: {provider}\n\n\
          User request:\n{user_request}\n\n\
@@ -1033,6 +1055,7 @@ fn build_final_review_prompt(
          Per-file reviews:\n{file_reviews}\n\n\
          Executed checks:\n{checks}\n\n\
          Requirements:\n\
+         - If you inspect repo state, use the worktree path rather than the launch cwd.\n\
          - Return a compact JSON object with keys: `executive_summary`, `summary_findings`, `inline_comments`, `notes`.\n\
          - In `summary_findings`, `file`, `priority`, `confidence`, `suggested_fix`, and `source_refs` are optional when they are obvious from context.\n\
          - In `inline_comments`, `file` is optional if obvious from context. Use either `line` or `start_line`; `end_line` is optional.\n\
@@ -1047,6 +1070,7 @@ fn build_final_review_prompt(
         pr_number = pr.number,
         pr_title = pr.title,
         pr_url = pr.url,
+        provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
         provider = "delegated-subprocess",
         user_request = render_user_request(options.user_request.as_deref()),

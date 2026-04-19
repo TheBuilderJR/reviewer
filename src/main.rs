@@ -77,6 +77,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let provider_cwd = std::env::current_dir().context("failed to determine current directory")?;
     let progress = Arc::new(ProgressReporter::new());
     let prompt_preamble = load_prompt_preamble().await?;
     let run_logger = Arc::new(RunLogger::create().await?);
@@ -134,6 +135,7 @@ async fn main() -> Result<()> {
         pr_number: request.pr_number,
         repo_name,
         repo_path,
+        provider_cwd,
         user_request: None,
         parallelism: args.parallelism.max(1),
         keep_worktree: args.keep_worktree,
