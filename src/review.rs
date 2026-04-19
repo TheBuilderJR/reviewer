@@ -14,7 +14,7 @@ use crate::github::fetch_pr_details;
 use crate::progress::ProgressReporter;
 use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
-use crate::shell::capture_command_with_input;
+use crate::shell::{CommandProgress, capture_command_with_input_reported};
 use crate::types::{
     BuildExecution, CheckExecution, CheckPlanDraft, FileReviewDraft, FileReviewJob,
     FinalReviewDraft, FinalReviewReport, InlineComment, PullRequestDetails, sort_findings,
@@ -43,7 +43,14 @@ pub async fn run_review(
             "phase",
             format!("loading PR #{} metadata", options.pr_number),
         );
-        match fetch_pr_details(&options.repo_path, &options.repo_name, options.pr_number).await {
+        match fetch_pr_details(
+            &options.repo_path,
+            &options.repo_name,
+            options.pr_number,
+            progress.clone(),
+        )
+        .await
+        {
             Ok(pr) => {
                 step.done(format!("{} changed files", pr.files.len()));
                 pr
@@ -60,7 +67,7 @@ pub async fn run_review(
             "phase",
             format!("fetching base branch {}", pr.base_ref_name),
         );
-        match fetch_base_branch(&options.repo_path, &pr.base_ref_name).await {
+        match fetch_base_branch(&options.repo_path, &pr.base_ref_name, progress.clone()).await {
             Ok(()) => step.done("base branch ready"),
             Err(error) => {
                 step.fail(error.to_string());
@@ -71,7 +78,7 @@ pub async fn run_review(
 
     let review_ref = {
         let step = progress.begin_step("phase", format!("checking out PR #{}", options.pr_number));
-        match fetch_pr_head_ref(&options.repo_path, options.pr_number).await {
+        match fetch_pr_head_ref(&options.repo_path, options.pr_number, progress.clone()).await {
             Ok(review_ref) => {
                 step.done(review_ref.clone());
                 review_ref
@@ -85,7 +92,14 @@ pub async fn run_review(
 
     let worktree = {
         let step = progress.begin_step("phase", "creating worktree".to_string());
-        match create_pr_worktree(&options.repo_path, options.pr_number, &review_ref).await {
+        match create_pr_worktree(
+            &options.repo_path,
+            options.pr_number,
+            &review_ref,
+            progress.clone(),
+        )
+        .await
+        {
             Ok(worktree) => {
                 step.done(worktree.path.display().to_string());
                 worktree
@@ -150,7 +164,7 @@ pub async fn run_review(
 
     if !options.keep_worktree {
         let step = progress.begin_step("phase", "cleaning up worktree".to_string());
-        match cleanup_worktree(&options.repo_path, &worktree).await {
+        match cleanup_worktree(&options.repo_path, &worktree, progress.clone()).await {
             Ok(()) => {
                 step.done("temporary worktree removed");
                 if let Ok(report) = run_result.as_mut() {
@@ -248,7 +262,12 @@ async fn prepare_file_jobs(
             "review",
             format!("[{}/{}] preparing {}", index + 1, total_files, file.path),
         );
-        let diff_excerpt = diff_for_file(&worktree.path, &pr.base_ref_name, &file.path)
+        let diff_excerpt = diff_for_file(
+            &worktree.path,
+            &pr.base_ref_name,
+            &file.path,
+            progress.clone(),
+        )
             .await
             .map(|value| excerpt(&value, 16_000))
             .unwrap_or_default();
@@ -423,7 +442,17 @@ async fn run_checks(
 
         let started_at = Instant::now();
         let args = vec!["-lc".to_string(), check.command.clone()];
-        let output = capture_command_with_input("bash", &args, &worktree.path, None).await;
+        let output = capture_command_with_input_reported(
+            "bash",
+            &args,
+            &worktree.path,
+            None,
+            Some(CommandProgress::new(
+                progress.clone(),
+                render_check_command_label(index + 1, total, &check.command),
+            )),
+        )
+        .await;
         let duration_secs = started_at.elapsed().as_secs_f32();
 
         let execution = match output {
@@ -903,6 +932,13 @@ fn truncate_line(value: &str, max_chars: usize) -> String {
 
     let shortened: String = trimmed.chars().take(max_chars.saturating_sub(3)).collect();
     format!("{shortened}...")
+}
+
+fn render_check_command_label(index: usize, total: usize, command: &str) -> String {
+    format!(
+        "check {index}/{total}: {}",
+        truncate_line(command.trim(), 120)
+    )
 }
 
 async fn invoke_with_semaphore<T>(

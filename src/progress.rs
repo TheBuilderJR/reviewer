@@ -64,6 +64,52 @@ impl ProgressReporter {
         }
     }
 
+    pub fn command_start(&self, label: impl AsRef<str>) {
+        self.emit("cmd", "START", label.as_ref());
+    }
+
+    pub fn command_heartbeat(&self, label: impl AsRef<str>, elapsed_secs: f32) {
+        self.emit(
+            "cmd",
+            "INFO",
+            &format!("{} ({elapsed_secs:.1}s elapsed)", label.as_ref()),
+        );
+    }
+
+    pub fn command_done(
+        &self,
+        label: impl AsRef<str>,
+        elapsed_secs: f32,
+        detail: impl AsRef<str>,
+    ) {
+        self.emit(
+            "cmd",
+            "DONE",
+            &format!(
+                "{} ({elapsed_secs:.1}s){}",
+                label.as_ref(),
+                render_detail(detail.as_ref())
+            ),
+        );
+    }
+
+    pub fn command_fail(
+        &self,
+        label: impl AsRef<str>,
+        elapsed_secs: f32,
+        detail: impl AsRef<str>,
+    ) {
+        self.emit(
+            "cmd",
+            "FAIL",
+            &format!(
+                "{} ({elapsed_secs:.1}s){}",
+                label.as_ref(),
+                render_detail(detail.as_ref())
+            ),
+        );
+    }
+
     fn emit(&self, area: &'static str, status: &str, message: &str) {
         eprintln!(
             "[{:>6.1}s] {:<7} {:<6} {}",

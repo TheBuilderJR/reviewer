@@ -11,7 +11,9 @@ use tempfile::tempdir;
 
 use crate::progress::ProgressReporter;
 use crate::runlog::RunLogger;
-use crate::shell::{capture_command_with_input, run_command};
+use crate::shell::{
+    CommandProgress, capture_command_with_input_reported, run_command,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderKind {
@@ -158,7 +160,16 @@ impl Provider for CodexProvider {
             .progress
             .begin_agent(render_agent_label(label, &prompt_path));
 
-        let output = capture_command_with_input("codex", &args, cwd, Some(&prompt))
+        let output = capture_command_with_input_reported(
+            "codex",
+            &args,
+            cwd,
+            Some(&prompt),
+            Some(CommandProgress::new(
+                self.progress.clone(),
+                render_command_label("codex", label),
+            )),
+        )
             .await
             .context("codex invocation failed")?;
 
@@ -300,7 +311,16 @@ impl Provider for ClaudeProvider {
             .progress
             .begin_agent(render_agent_label(label, &prompt_path));
 
-        let output = capture_command_with_input("claude", &args, cwd, Some(&prompt))
+        let output = capture_command_with_input_reported(
+            "claude",
+            &args,
+            cwd,
+            Some(&prompt),
+            Some(CommandProgress::new(
+                self.progress.clone(),
+                render_command_label("claude", label),
+            )),
+        )
             .await
             .context("claude invocation failed")?;
 
@@ -440,6 +460,10 @@ fn merge_prompt(prompt_preamble: Option<&PromptPreamble>, prompt: &str) -> Strin
 
 fn render_agent_label(label: &str, prompt_path: &Path) -> String {
     format!("{label} ({})", prompt_path.display())
+}
+
+fn render_command_label(program: &str, label: &str) -> String {
+    format!("{program} subprocess for {label}")
 }
 
 fn add_json_output_contract(prompt: &str, output_path: &Path) -> String {

@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     let repo_name = match &request.repo_name {
         Some(repo) => repo.clone(),
-        None => github::resolve_repo_name(&repo_path).await?,
+        None => github::resolve_repo_name(&repo_path, progress.clone()).await?,
     };
 
     let options = ReviewOptions {
@@ -236,7 +236,7 @@ async fn resolve_repo_checkout(
     };
 
     if let Some(path) = &explicit_path {
-        if !is_git_repo(path).await {
+        if !is_git_repo(path, progress.clone()).await {
             bail!(
                 "repo path {} is not a git checkout. Point --repo-path at a clone of the target repo or omit it and let reviewer clone the repo automatically.",
                 path.display()
@@ -244,7 +244,7 @@ async fn resolve_repo_checkout(
         }
 
         if let Some(expected_repo) = &request.repo_name {
-            let actual_repo = github::resolve_repo_name(path)
+            let actual_repo = github::resolve_repo_name(path, progress.clone())
                 .await
                 .with_context(|| format!("failed to resolve GitHub repo for {}", path.display()))?;
             if actual_repo != *expected_repo {
@@ -265,9 +265,9 @@ async fn resolve_repo_checkout(
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    if is_git_repo(&cwd).await {
+    if is_git_repo(&cwd, progress.clone()).await {
         if let Some(expected_repo) = &request.repo_name {
-            if let Ok(actual_repo) = github::resolve_repo_name(&cwd).await {
+            if let Ok(actual_repo) = github::resolve_repo_name(&cwd, progress.clone()).await {
                 if actual_repo == *expected_repo {
                     let cwd = cwd
                         .canonicalize()
@@ -292,7 +292,7 @@ async fn resolve_repo_checkout(
         "phase",
         format!("materializing repo checkout for {}", repo_name),
     );
-    let repo_path = github::ensure_repo_checkout(repo_name, &clone_dir).await?;
+    let repo_path = github::ensure_repo_checkout(repo_name, &clone_dir, progress.clone()).await?;
     step.done(repo_path.display().to_string());
     Ok(repo_path)
 }

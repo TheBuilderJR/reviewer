@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::shell::run_command;
+use crate::progress::ProgressReporter;
+use crate::shell::{CommandProgress, run_command_reported};
 use crate::types::{ChangedFile, PullRequestDetails};
 
 #[derive(Debug, Deserialize)]
@@ -34,14 +36,22 @@ struct GhFile {
     deletions: Option<u64>,
 }
 
-pub async fn resolve_repo_name(repo_path: &Path) -> Result<String> {
+pub async fn resolve_repo_name(
+    repo_path: &Path,
+    progress: Arc<ProgressReporter>,
+) -> Result<String> {
     let args = vec![
         "repo".to_string(),
         "view".to_string(),
         "--json".to_string(),
         "nameWithOwner".to_string(),
     ];
-    let output = run_command("gh", &args, repo_path)
+    let output = run_command_reported(
+        "gh",
+        &args,
+        repo_path,
+        CommandProgress::new(progress, "gh repo view --json nameWithOwner"),
+    )
         .await
         .context("failed to resolve GitHub repo via gh")?;
     let value: GhRepoView =
@@ -49,7 +59,11 @@ pub async fn resolve_repo_name(repo_path: &Path) -> Result<String> {
     Ok(value.name_with_owner)
 }
 
-pub async fn ensure_repo_checkout(repo: &str, target_dir: &Path) -> Result<PathBuf> {
+pub async fn ensure_repo_checkout(
+    repo: &str,
+    target_dir: &Path,
+    progress: Arc<ProgressReporter>,
+) -> Result<PathBuf> {
     if target_dir.exists() {
         return Ok(target_dir.to_path_buf());
     }
@@ -69,7 +83,12 @@ pub async fn ensure_repo_checkout(repo: &str, target_dir: &Path) -> Result<PathB
         "--".to_string(),
         "--filter=blob:none".to_string(),
     ];
-    run_command("gh", &args, parent)
+    run_command_reported(
+        "gh",
+        &args,
+        parent,
+        CommandProgress::new(progress, format!("gh repo clone {repo}")),
+    )
         .await
         .with_context(|| format!("failed to clone {repo} into {}", target_dir.display()))?;
 
@@ -80,6 +99,7 @@ pub async fn fetch_pr_details(
     repo_path: &Path,
     repo: &str,
     pr_number: u64,
+    progress: Arc<ProgressReporter>,
 ) -> Result<PullRequestDetails> {
     let args = vec![
         "pr".to_string(),
@@ -91,7 +111,12 @@ pub async fn fetch_pr_details(
         "number,title,url,body,baseRefName,headRefName,headRefOid,files".to_string(),
     ];
 
-    let output = run_command("gh", &args, repo_path)
+    let output = run_command_reported(
+        "gh",
+        &args,
+        repo_path,
+        CommandProgress::new(progress, format!("gh pr view #{pr_number}")),
+    )
         .await
         .with_context(|| format!("failed to fetch PR #{pr_number}"))?;
 
