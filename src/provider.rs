@@ -7,7 +7,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tempfile::tempdir;
 
 use crate::progress::ProgressReporter;
 use crate::runlog::RunLogger;
@@ -117,13 +116,13 @@ impl Provider for CodexProvider {
         prompt: &str,
         label: &str,
     ) -> Result<Value> {
-        let prompt = self.materialize_prompt(prompt);
-        let temp = tempdir().context("failed to create temp dir for codex run")?;
-        let schema_path = temp.path().join("schema.json");
-        let output_path = temp.path().join("output.json");
-        tokio::fs::write(&schema_path, serde_json::to_vec_pretty(schema)?)
-            .await
-            .context("failed to write codex schema")?;
+        let base_prompt = self.materialize_prompt(prompt);
+        let invocation = self.run_logger.begin(label);
+        let raw_output_path = self.run_logger.artifact_path(&invocation, "model-output", "txt");
+        let structured_output_path =
+            self.run_logger
+                .artifact_path(&invocation, "structured-response", "json");
+        let prompt = add_json_output_contract(&base_prompt, &structured_output_path);
 
         let mut args = self.extra_args.clone();
         args.extend(vec![
@@ -134,10 +133,8 @@ impl Provider for CodexProvider {
             "never".to_string(),
             "-C".to_string(),
             cwd.display().to_string(),
-            "--output-schema".to_string(),
-            schema_path.display().to_string(),
             "-o".to_string(),
-            output_path.display().to_string(),
+            raw_output_path.display().to_string(),
             "-".to_string(),
         ]);
 
@@ -151,7 +148,6 @@ impl Provider for CodexProvider {
             );
         }
 
-        let invocation = self.run_logger.begin(label);
         let prompt_path = self
             .run_logger
             .write_prompt(&invocation, "codex", &args, cwd, schema, &prompt)
@@ -173,19 +169,53 @@ impl Provider for CodexProvider {
             .await
             .context("codex invocation failed")?;
 
-        let body = tokio::fs::read_to_string(&output_path)
+        let mut raw_response = tokio::fs::read_to_string(&raw_output_path)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| output.stdout.clone());
         let mut parsed = None::<Value>;
         let mut error = None::<String>;
 
         if output.success {
-            match serde_json::from_str::<Value>(&body) {
-                Ok(value) => parsed = Some(value),
-                Err(parse_error) => {
-                    error = Some(format!(
-                        "failed to parse codex output as JSON: {parse_error}"
-                    ));
+            if let Some(file_body) = tokio::fs::read_to_string(&structured_output_path).await.ok() {
+                raw_response = file_body.clone();
+                match serde_json::from_str::<Value>(&file_body) {
+                    Ok(value) => parsed = Some(value),
+                    Err(parse_error) => {
+                        error = Some(format!(
+                            "failed to parse structured output file {} as JSON: {parse_error}",
+                            structured_output_path.display()
+                        ));
+                    }
+                }
+            }
+
+            if parsed.is_none() {
+                let candidate = if raw_response.trim().is_empty() {
+                    output.stdout.trim()
+                } else {
+                    raw_response.trim()
+                };
+
+                if !candidate.is_empty() {
+                    match serde_json::from_str::<Value>(candidate) {
+                        Ok(value) => {
+                            parsed = Some(value);
+                            error = None;
+                        }
+                        Err(_) => match extract_json_from_text(candidate) {
+                            Ok(value) => {
+                                parsed = Some(value);
+                                error = None;
+                            }
+                            Err(parse_error) => {
+                                error = Some(format!(
+                                    "failed to extract codex payload: {parse_error}"
+                                ));
+                            }
+                        },
+                    }
+                } else {
+                    error = Some("codex returned no parseable output".to_string());
                 }
             }
         } else {
@@ -198,7 +228,7 @@ impl Provider for CodexProvider {
                 "codex",
                 &args,
                 cwd,
-                &body,
+                &raw_response,
                 &output.stdout,
                 &output.stderr,
                 parsed.as_ref(),
