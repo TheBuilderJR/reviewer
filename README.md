@@ -10,7 +10,7 @@ For a GitHub PR, the harness:
 2. Runs an explicit build/setup phase in the PR worktree, driven by the instructions in `~/.reviewer.md`.
 3. Prepares one review job per changed file.
 4. Shells out to the selected provider for one reviewer per changed file, with each reviewer starting from that file but allowed to inspect nearby code in other files.
-5. Uses the build result plus those file reviews to plan at least 5 checks, then runs those checks sequentially in the PR worktree.
+5. Uses the build result plus those file reviews to plan targeted checks iteratively, usually aiming for 5 when there is enough signal, then runs the planned checks sequentially in the PR worktree.
 6. Writes a final review with an executive summary and inline comments like a real code review.
 7. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
 8. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.

@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::fs::OpenOptions;
-use tokio::sync::Mutex;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -134,9 +134,7 @@ impl RunLogger {
         let transcript_path = self.artifact_path(invocation, "initial-prompt", "txt");
         self.append_to_path(
             &transcript_path,
-            &format!(
-                "\n\n===== LIVE SUBPROCESS STREAM =====\nprovider: {provider}\n\n"
-            ),
+            &format!("\n\n===== LIVE SUBPROCESS STREAM =====\nprovider: {provider}\n\n"),
         )
         .await?;
         Ok(LiveStreamLogger {
@@ -232,23 +230,19 @@ impl LiveStreamLogger {
                     self.transcript_path.display()
                 )
             })?;
-        file.write_all(chunk.as_bytes())
-            .await
-            .with_context(|| {
+        file.write_all(chunk.as_bytes()).await.with_context(|| {
+            format!(
+                "failed appending run artifact {}",
+                self.transcript_path.display()
+            )
+        })?;
+        if !chunk.ends_with('\n') {
+            file.write_all(b"\n").await.with_context(|| {
                 format!(
                     "failed appending run artifact {}",
                     self.transcript_path.display()
                 )
             })?;
-        if !chunk.ends_with('\n') {
-            file.write_all(b"\n")
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed appending run artifact {}",
-                        self.transcript_path.display()
-                    )
-                })?;
         }
         Ok(())
     }

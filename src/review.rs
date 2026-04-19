@@ -16,10 +16,14 @@ use crate::provider::{Provider, invoke_typed};
 use crate::runlog::RunLogger;
 use crate::shell::{CommandProgress, capture_command_with_input_reported};
 use crate::types::{
-    BuildExecution, CheckExecution, CheckPlanDraft, FileReviewDraft, FileReviewJob,
-    FinalReviewDraft, FinalReviewReport, InlineComment, PullRequestDetails, sort_findings,
-    sort_inline_comments,
+    BuildExecution, CheckExecution, CheckGenerationDraft, CheckPlanDraft, CheckSpec,
+    FileReviewDraft, FileReviewJob, FinalReviewDraft, FinalReviewReport, InlineComment,
+    PullRequestDetails, sort_findings, sort_inline_comments,
 };
+
+const TARGET_CHECK_COUNT: usize = 5;
+const MAX_CHECK_PLAN_ROUNDS: usize = 8;
+const MAX_EMPTY_CHECK_ROUNDS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct ReviewOptions {
@@ -268,9 +272,9 @@ async fn prepare_file_jobs(
             &file.path,
             progress.clone(),
         )
-            .await
-            .map(|value| excerpt(&value, 16_000))
-            .unwrap_or_default();
+        .await
+        .map(|value| excerpt(&value, 16_000))
+        .unwrap_or_default();
 
         jobs.push(FileReviewJob {
             file: file.path.clone(),
@@ -379,17 +383,100 @@ async fn plan_checks(
     progress: Arc<ProgressReporter>,
 ) -> Result<CheckPlanDraft> {
     let step = progress.begin_step("phase", "planning checks".to_string());
-    progress.set_agent_total(1);
-    let prompt = build_check_plan_prompt(options, pr, build, file_reviews, worktree);
+    progress.set_agent_total(MAX_CHECK_PLAN_ROUNDS);
     let plan_result: Result<CheckPlanDraft> = async {
-        let mut plan: CheckPlanDraft = invoke_typed(
-            provider.as_ref(),
-            &options.provider_cwd,
-            &[worktree.path.clone()],
-            &format!("plan checks {}", pr.number),
-            &prompt,
-        )
-        .await?;
+        let mut checks = Vec::new();
+        let mut summaries = Vec::new();
+        let mut empty_rounds = 0usize;
+        let mut duplicate_rounds = 0usize;
+        let mut stop_reason = None::<String>;
+
+        for round in 0..MAX_CHECK_PLAN_ROUNDS {
+            let prompt = build_next_check_prompt(
+                options,
+                pr,
+                build,
+                file_reviews,
+                &checks,
+                worktree,
+                round + 1,
+                TARGET_CHECK_COUNT,
+                MAX_CHECK_PLAN_ROUNDS,
+            );
+
+            let mut draft: CheckGenerationDraft = invoke_typed(
+                provider.as_ref(),
+                &options.provider_cwd,
+                &[worktree.path.clone()],
+                &format!("plan check {} for PR {}", round + 1, pr.number),
+                &prompt,
+            )
+            .await?;
+            normalize_check_generation(&mut draft, checks.len());
+            let planner_done = draft.done;
+
+            if !draft.summary.trim().is_empty() {
+                summaries.push(draft.summary.clone());
+            }
+
+            let Some(mut next_check) = take_next_check(draft) else {
+                if planner_done {
+                    stop_reason = Some("planner reported no more useful checks".to_string());
+                    break;
+                }
+                empty_rounds += 1;
+                if empty_rounds >= MAX_EMPTY_CHECK_ROUNDS {
+                    stop_reason = Some("planner stopped producing runnable checks".to_string());
+                    break;
+                }
+                continue;
+            };
+
+            empty_rounds = 0;
+            normalize_check_spec(checks.len(), &mut next_check);
+            if next_check.command.trim().is_empty() {
+                if planner_done {
+                    stop_reason =
+                        Some("planner ended without producing a runnable command".to_string());
+                    break;
+                }
+                duplicate_rounds += 1;
+                if duplicate_rounds >= MAX_EMPTY_CHECK_ROUNDS {
+                    stop_reason = Some("planner repeatedly omitted a runnable command".to_string());
+                    break;
+                }
+                continue;
+            }
+
+            if is_duplicate_check(&next_check, &checks) {
+                if planner_done {
+                    stop_reason = Some("planner ended on a duplicate check".to_string());
+                    break;
+                }
+                duplicate_rounds += 1;
+                if duplicate_rounds >= MAX_EMPTY_CHECK_ROUNDS {
+                    stop_reason = Some("planner repeated duplicate checks".to_string());
+                    break;
+                }
+                continue;
+            }
+
+            duplicate_rounds = 0;
+            checks.push(next_check);
+            if planner_done {
+                stop_reason = Some("planner marked the check list complete".to_string());
+                break;
+            }
+            if checks.len() >= TARGET_CHECK_COUNT {
+                stop_reason = Some(format!("reached target of {TARGET_CHECK_COUNT} checks"));
+                break;
+            }
+        }
+
+        let mut plan = CheckPlanDraft {
+            summary: select_check_plan_summary(&summaries, checks.len(), stop_reason.as_deref()),
+            checks,
+        };
         normalize_check_plan(&mut plan);
         validate_check_plan(&plan)?;
         Ok(plan)
@@ -398,7 +485,12 @@ async fn plan_checks(
 
     match plan_result {
         Ok(plan) => {
-            step.done(format!("{} checks planned", plan.checks.len()));
+            let detail = if plan.checks.is_empty() {
+                "no runnable checks planned; continuing without post-review checks".to_string()
+            } else {
+                format!("{} checks planned", plan.checks.len())
+            };
+            step.done(detail);
             Ok(plan)
         }
         Err(error) => {
@@ -415,11 +507,13 @@ async fn run_checks(
     run_logger: Arc<RunLogger>,
     progress: Arc<ProgressReporter>,
 ) -> Result<Vec<CheckExecution>> {
-    let step = progress.begin_step(
-        "phase",
-        format!("running {} checks sequentially", plan.checks.len()),
-    );
     let total = plan.checks.len();
+    let step = progress.begin_step("phase", format!("running {} checks sequentially", total));
+    if total == 0 {
+        step.done("no runnable checks were planned");
+        return Ok(Vec::new());
+    }
+
     let mut executions = Vec::with_capacity(total);
 
     for (index, check) in plan.checks.iter().enumerate() {
@@ -684,12 +778,6 @@ fn validate_build_execution(result: &BuildExecution) -> Result<()> {
 }
 
 fn validate_check_plan(plan: &CheckPlanDraft) -> Result<()> {
-    anyhow::ensure!(
-        plan.checks.len() >= 5,
-        "check plan returned {} checks; expected at least 5",
-        plan.checks.len()
-    );
-
     for (index, check) in plan.checks.iter().enumerate() {
         anyhow::ensure!(
             !check.name.trim().is_empty(),
@@ -758,16 +846,46 @@ fn normalize_build_execution(result: &mut BuildExecution) {
 }
 
 fn normalize_check_plan(plan: &mut CheckPlanDraft) {
+    let mut unique_checks = Vec::with_capacity(plan.checks.len());
+    for mut check in std::mem::take(&mut plan.checks) {
+        normalize_check_spec(unique_checks.len(), &mut check);
+        if check.command.trim().is_empty() || is_duplicate_check(&check, &unique_checks) {
+            continue;
+        }
+        unique_checks.push(check);
+    }
+    plan.checks = unique_checks;
+
     if plan.summary.trim().is_empty() {
         plan.summary = fallback_check_plan_summary(plan.checks.len());
     }
+}
 
-    for (index, check) in plan.checks.iter_mut().enumerate() {
-        normalize_check_spec(index, check);
+fn normalize_check_generation(draft: &mut CheckGenerationDraft, existing_checks: usize) {
+    if draft.summary.trim().is_empty() {
+        draft.summary = if draft.done {
+            fallback_check_plan_summary(existing_checks)
+        } else {
+            "Continuing to assemble targeted post-review checks.".to_string()
+        };
+    }
+
+    if draft.check.is_none() && !draft.checks.is_empty() {
+        draft.check = draft.checks.drain(..).next();
     }
 }
 
-fn normalize_check_spec(index: usize, check: &mut crate::types::CheckSpec) {
+fn take_next_check(mut draft: CheckGenerationDraft) -> Option<CheckSpec> {
+    if draft.done && draft.check.is_none() && draft.checks.is_empty() {
+        return None;
+    }
+    draft
+        .check
+        .take()
+        .or_else(|| draft.checks.into_iter().next())
+}
+
+fn normalize_check_spec(index: usize, check: &mut CheckSpec) {
     if check.name.trim().is_empty() {
         check.name = first_nonempty_line(&check.command)
             .map(|line| format!("Check {}: {}", index + 1, truncate_line(&line, 72)))
@@ -779,14 +897,55 @@ fn normalize_check_spec(index: usize, check: &mut crate::types::CheckSpec) {
     }
 
     if check.rationale.trim().is_empty() {
-        check.rationale = "Validate the changed behavior and guard against regressions."
-            .to_string();
+        check.rationale =
+            "Validate the changed behavior and guard against regressions.".to_string();
     }
 
     if check.expected_signal.trim().is_empty() {
         check.expected_signal =
             "The command should complete successfully and confirm the expected behavior."
                 .to_string();
+    }
+}
+
+fn is_duplicate_check(candidate: &CheckSpec, existing: &[CheckSpec]) -> bool {
+    let candidate_command = normalize_check_identity(&candidate.command);
+    let candidate_name = normalize_check_identity(&candidate.name);
+    existing.iter().any(|existing_check| {
+        let existing_command = normalize_check_identity(&existing_check.command);
+        let existing_name = normalize_check_identity(&existing_check.name);
+        (!candidate_command.is_empty() && candidate_command == existing_command)
+            || (!candidate_name.is_empty()
+                && !existing_name.is_empty()
+                && candidate_name == existing_name
+                && candidate_command == existing_command)
+    })
+}
+
+fn normalize_check_identity(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn select_check_plan_summary(
+    summaries: &[String],
+    check_count: usize,
+    stop_reason: Option<&str>,
+) -> String {
+    let base = summaries
+        .iter()
+        .rev()
+        .map(|summary| summary.trim())
+        .find(|summary| !summary.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| fallback_check_plan_summary(check_count));
+
+    match stop_reason {
+        Some(reason) if !reason.trim().is_empty() => format!("{base} Stop reason: {reason}."),
+        _ => base,
     }
 }
 
@@ -912,7 +1071,11 @@ fn fallback_build_summary(status: &str, command_count: usize) -> String {
 }
 
 fn fallback_check_plan_summary(check_count: usize) -> String {
-    format!("Planned {check_count} targeted post-review checks.")
+    if check_count == 0 {
+        "No additional non-interactive post-review checks were planned.".to_string()
+    } else {
+        format!("Planned {check_count} targeted post-review checks.")
+    }
 }
 
 fn first_nonempty_line(value: &str) -> Option<String> {
@@ -1054,12 +1217,16 @@ fn build_repo_prompt(
     )
 }
 
-fn build_check_plan_prompt(
+fn build_next_check_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     build: &BuildExecution,
     file_reviews: &[FileReviewDraft],
+    planned_checks: &[CheckSpec],
     worktree: &Worktree,
+    round: usize,
+    target_count: usize,
+    max_rounds: usize,
 ) -> String {
     let changed_files = pr
         .files
@@ -1083,41 +1250,58 @@ fn build_check_plan_prompt(
     } else {
         changed_test_files.join("\n")
     };
+    let existing_checks = if planned_checks.is_empty() {
+        "[]".to_string()
+    } else {
+        serde_json::to_string_pretty(planned_checks).unwrap_or_else(|_| "[]".to_string())
+    };
 
     format!(
         "You are planning the checks phase for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
+         This planner runs incrementally: return at most one new check for this round.\n\
          Agent launch cwd: {provider_cwd}\n\
          Worktree path: {worktree}\n\
-         Base branch: {base}\n\n\
+         Base branch: {base}\n\
+         Planning round: {round}/{max_rounds}\n\
+         Existing planned checks: {existing_count}/{target_count}\n\n\
          User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Changed test-like files:\n{changed_test_files}\n\n\
          Build phase result:\n{build}\n\n\
          Per-file review results:\n{file_reviews}\n\n\
+         Checks already planned:\n{existing_checks}\n\n\
          Requirements:\n\
          - If you inspect repo state, use the worktree path rather than the launch cwd.\n\
-         - Return a compact JSON object with keys: `summary` and `checks`.\n\
-         - Return at least 5 checks.\n\
-         - Every check object must include a non-empty `name` and a non-empty `command`.\n\
-         - Use the exact keys `name`, `command`, `rationale`, `expected_signal`, and `related_findings`. Do not substitute alternate key names.\n\
-         - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
+         - Return a compact JSON object with keys: `summary`, `done`, and `check`.\n\
+         - `check` must be either a single check object or omitted/null. Do not return more than one new check in this round.\n\
+         - Aim to reach {target_count} total checks when there is enough meaningful coverage to justify them, but do not pad with low-value or duplicate commands.\n\
+         - If there are no more worthwhile non-interactive checks, set `done` to true and omit `check`.\n\
+         - Every returned check must include a non-empty `name` and a non-empty `command`.\n\
+         - Use the exact keys `name`, `command`, `rationale`, `expected_signal`, and `related_findings` inside `check`. Do not substitute alternate key names.\n\
+         - If no checks have been planned yet, the first useful check should run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
          - Use the build phase result plus repo-specific guidance from the global reviewer instructions when choosing commands.\n\
          - Prefer targeted checks first, then broader validation where useful.\n\
-         - Avoid duplicate commands.\n\
+         - Avoid duplicates of any already-planned command.\n\
          - Every check should include a clear rationale and expected signal, but those fields can be brief.\n\
-         - Related findings should cite finding titles, inline comment titles, or file paths, not vague references.",
+         - Related findings should cite finding titles, inline comment titles, or file paths, not vague references.\n\
+         - Be conservative: it is acceptable to stop before {target_count} checks if additional commands would be redundant, speculative, too broad, or not runnable from the current environment.",
         pr_number = pr.number,
         pr_title = pr.title,
         repo = options.repo_name,
         provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
         base = pr.base_ref_name,
+        round = round,
+        max_rounds = max_rounds,
+        existing_count = planned_checks.len(),
+        target_count = target_count,
         user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files,
         changed_test_files = changed_test_files,
         build = serde_json::to_string_pretty(build).unwrap_or_default(),
-        file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default()
+        file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default(),
+        existing_checks = existing_checks
     )
 }
 
@@ -1370,6 +1554,14 @@ fn excerpt(value: &str, max_chars: usize) -> String {
 }
 
 fn summarize_checks(plan_summary: &str, checks: &[CheckExecution]) -> String {
+    let summary = plan_summary.trim();
+    if checks.is_empty() {
+        if summary.is_empty() {
+            return "No post-review checks were executed.".to_string();
+        }
+        return format!("{summary}\n\nNo post-review checks were executed.");
+    }
+
     let passed = checks
         .iter()
         .filter(|check| check.status == "passed")
@@ -1385,7 +1577,7 @@ fn summarize_checks(plan_summary: &str, checks: &[CheckExecution]) -> String {
 
     format!(
         "{}\n\nExecuted {} checks: {} passed, {} failed, {} errored.",
-        plan_summary.trim(),
+        summary,
         checks.len(),
         passed,
         failed,
@@ -1419,5 +1611,49 @@ fn line_range_label(comment: &InlineComment) -> String {
         (Some(start), Some(end)) if end > start => format!("L{start}-L{end}"),
         (Some(start), _) => format!("L{start}"),
         _ => "file-level".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CheckPlanDraft, CheckSpec, fallback_check_plan_summary, is_duplicate_check,
+        summarize_checks, validate_check_plan,
+    };
+
+    #[test]
+    fn validate_check_plan_allows_zero_checks() {
+        let plan = CheckPlanDraft {
+            summary: fallback_check_plan_summary(0),
+            checks: Vec::new(),
+        };
+
+        validate_check_plan(&plan).expect("empty check plan should be allowed");
+    }
+
+    #[test]
+    fn duplicate_checks_are_detected_by_command() {
+        let existing = vec![CheckSpec {
+            name: "Run focused test".to_string(),
+            command: "python -m pytest test/dynamo/test_exc.py -k source_location".to_string(),
+            rationale: String::new(),
+            expected_signal: String::new(),
+            related_findings: Vec::new(),
+        }];
+        let candidate = CheckSpec {
+            name: "Same command, different spacing".to_string(),
+            command: "python   -m   pytest test/dynamo/test_exc.py -k source_location".to_string(),
+            rationale: String::new(),
+            expected_signal: String::new(),
+            related_findings: Vec::new(),
+        };
+
+        assert!(is_duplicate_check(&candidate, &existing));
+    }
+
+    #[test]
+    fn summarize_checks_handles_zero_checks() {
+        let summary = summarize_checks("Planner found no safe follow-up checks.", &[]);
+        assert!(summary.contains("No post-review checks were executed."));
     }
 }

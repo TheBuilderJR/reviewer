@@ -76,10 +76,7 @@ pub async fn create_pr_worktree(
         "git",
         &prefix(repo_path, add_args),
         repo_path,
-        CommandProgress::new(
-            progress,
-            format!("git worktree add for PR #{pr_number}"),
-        ),
+        CommandProgress::new(progress, format!("git worktree add for PR #{pr_number}")),
     )
     .await
     .context("failed creating worktree")?;
@@ -141,8 +138,8 @@ pub async fn fetch_base_branch(
         repo_path,
         CommandProgress::new(progress, format!("git fetch origin {base_ref}")),
     )
-        .await
-        .with_context(|| format!("failed fetching base branch {base_ref}"))?;
+    .await
+    .with_context(|| format!("failed fetching base branch {base_ref}"))?;
     Ok(())
 }
 
@@ -161,16 +158,14 @@ pub async fn diff_for_file(
         "--".to_string(),
         file.to_string(),
     ];
-    Ok(
-        run_command_reported(
-            "git",
-            &args,
-            worktree_path,
-            CommandProgress::new(progress, format!("git diff for {file}")),
-        )
-        .await?
-        .stdout,
+    Ok(run_command_reported(
+        "git",
+        &args,
+        worktree_path,
+        CommandProgress::new(progress, format!("git diff for {file}")),
     )
+    .await?
+    .stdout)
 }
 
 fn prefix(repo_path: &Path, args: Vec<String>) -> Vec<String> {

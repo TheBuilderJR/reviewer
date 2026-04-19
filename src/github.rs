@@ -52,8 +52,8 @@ pub async fn resolve_repo_name(
         repo_path,
         CommandProgress::new(progress, "gh repo view --json nameWithOwner"),
     )
-        .await
-        .context("failed to resolve GitHub repo via gh")?;
+    .await
+    .context("failed to resolve GitHub repo via gh")?;
     let value: GhRepoView =
         serde_json::from_str(&output.stdout).context("failed to parse gh repo view output")?;
     Ok(value.name_with_owner)
@@ -89,8 +89,8 @@ pub async fn ensure_repo_checkout(
         parent,
         CommandProgress::new(progress, format!("gh repo clone {repo}")),
     )
-        .await
-        .with_context(|| format!("failed to clone {repo} into {}", target_dir.display()))?;
+    .await
+    .with_context(|| format!("failed to clone {repo} into {}", target_dir.display()))?;
 
     Ok(target_dir.to_path_buf())
 }
@@ -117,8 +117,8 @@ pub async fn fetch_pr_details(
         repo_path,
         CommandProgress::new(progress, format!("gh pr view #{pr_number}")),
     )
-        .await
-        .with_context(|| format!("failed to fetch PR #{pr_number}"))?;
+    .await
+    .with_context(|| format!("failed to fetch PR #{pr_number}"))?;
 
     let pr: GhPrView =
         serde_json::from_str(&output.stdout).context("failed to parse gh pr view output")?;

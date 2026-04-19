@@ -104,10 +104,7 @@ impl<'de> Deserialize<'de> for InlineComment {
         let draft = InlineCommentDraft::deserialize(deserializer)?;
         Ok(Self {
             file: first_nonempty_string([draft.file, draft.path]),
-            start_line: draft
-                .start_line
-                .or(draft.line)
-                .or(draft.line_number),
+            start_line: draft.start_line.or(draft.line).or(draft.line_number),
             end_line: draft.end_line,
             title: first_nonempty_string([draft.title, draft.summary, draft.label]),
             priority: draft.priority,
@@ -154,7 +151,11 @@ pub struct BuildExecution {
     pub status: String,
     #[serde(default, alias = "result")]
     pub summary: String,
-    #[serde(default, alias = "commands", deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "commands",
+        deserialize_with = "deserialize_string_list"
+    )]
     pub commands_run: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub notes: Vec<String>,
@@ -175,7 +176,11 @@ pub struct CheckSpec {
         alias = "success_criteria"
     )]
     pub expected_signal: String,
-    #[serde(default, alias = "related", deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "related",
+        deserialize_with = "deserialize_string_list"
+    )]
     pub related_findings: Vec<String>,
 }
 
@@ -183,6 +188,18 @@ pub struct CheckSpec {
 pub struct CheckPlanDraft {
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub checks: Vec<CheckSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckGenerationDraft {
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default, alias = "complete", alias = "finished", alias = "stop")]
+    pub done: bool,
+    #[serde(default, alias = "next_check", alias = "candidate")]
+    pub check: Option<CheckSpec>,
     #[serde(default)]
     pub checks: Vec<CheckSpec>,
 }
@@ -304,7 +321,9 @@ fn first_nonempty_string<const N: usize>(values: [String; N]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{BuildExecution, CheckPlanDraft, CheckSpec, FileReviewDraft, InlineComment, ReviewFinding};
+    use super::{
+        BuildExecution, CheckPlanDraft, CheckSpec, FileReviewDraft, InlineComment, ReviewFinding,
+    };
 
     #[test]
     fn deserializes_file_review_without_top_level_file() {

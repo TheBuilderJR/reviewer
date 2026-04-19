@@ -86,7 +86,9 @@ where
     T: DeserializeOwned + JsonSchema,
 {
     let schema = serde_json::to_value(schemars::schema_for!(T))?;
-    let value = provider.invoke(cwd, extra_dirs, &schema, prompt, label).await?;
+    let value = provider
+        .invoke(cwd, extra_dirs, &schema, prompt, label)
+        .await?;
     serde_json::from_value(value).with_context(|| {
         format!(
             "failed to deserialize {} response",
@@ -119,7 +121,9 @@ impl Provider for CodexProvider {
     ) -> Result<Value> {
         let base_prompt = self.materialize_prompt(prompt);
         let invocation = self.run_logger.begin(label);
-        let raw_output_path = self.run_logger.artifact_path(&invocation, "model-output", "txt");
+        let raw_output_path = self
+            .run_logger
+            .artifact_path(&invocation, "model-output", "txt");
         let structured_output_path =
             self.run_logger
                 .artifact_path(&invocation, "structured-response", "json");
@@ -172,8 +176,8 @@ impl Provider for CodexProvider {
             )),
             Some(live_stream),
         )
-            .await
-            .context("codex invocation failed")?;
+        .await
+        .context("codex invocation failed")?;
 
         let mut raw_response = tokio::fs::read_to_string(&raw_output_path)
             .await
@@ -182,7 +186,10 @@ impl Provider for CodexProvider {
         let mut error = None::<String>;
 
         if output.success {
-            if let Some(file_body) = tokio::fs::read_to_string(&structured_output_path).await.ok() {
+            if let Some(file_body) = tokio::fs::read_to_string(&structured_output_path)
+                .await
+                .ok()
+            {
                 raw_response = file_body.clone();
                 match serde_json::from_str::<Value>(&file_body) {
                     Ok(value) => parsed = Some(value),
@@ -214,9 +221,8 @@ impl Provider for CodexProvider {
                                 error = None;
                             }
                             Err(parse_error) => {
-                                error = Some(format!(
-                                    "failed to extract codex payload: {parse_error}"
-                                ));
+                                error =
+                                    Some(format!("failed to extract codex payload: {parse_error}"));
                             }
                         },
                     }
@@ -317,10 +323,7 @@ impl Provider for ClaudeProvider {
             if extra_dir.as_path() == cwd || extra_dir.as_path() == self.run_logger.root() {
                 continue;
             }
-            args.extend([
-                "--add-dir".to_string(),
-                extra_dir.display().to_string(),
-            ]);
+            args.extend(["--add-dir".to_string(), extra_dir.display().to_string()]);
         }
 
         args.push("-".to_string());
@@ -357,8 +360,8 @@ impl Provider for ClaudeProvider {
                 render_command_label("claude", label),
             )),
         )
-            .await
-            .context("claude invocation failed")?;
+        .await
+        .context("claude invocation failed")?;
 
         let mut parsed = None::<Value>;
         let mut error = None::<String>;

@@ -76,12 +76,7 @@ impl ProgressReporter {
         );
     }
 
-    pub fn command_done(
-        &self,
-        label: impl AsRef<str>,
-        elapsed_secs: f32,
-        detail: impl AsRef<str>,
-    ) {
+    pub fn command_done(&self, label: impl AsRef<str>, elapsed_secs: f32, detail: impl AsRef<str>) {
         self.emit(
             "cmd",
             "DONE",
@@ -93,12 +88,7 @@ impl ProgressReporter {
         );
     }
 
-    pub fn command_fail(
-        &self,
-        label: impl AsRef<str>,
-        elapsed_secs: f32,
-        detail: impl AsRef<str>,
-    ) {
+    pub fn command_fail(&self, label: impl AsRef<str>, elapsed_secs: f32, detail: impl AsRef<str>) {
         self.emit(
             "cmd",
             "FAIL",
