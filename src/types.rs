@@ -51,22 +51,75 @@ pub struct ReviewFinding {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct InlineComment {
-    #[serde(default, alias = "path")]
     pub file: String,
-    #[serde(default, alias = "line", alias = "line_number")]
     pub start_line: Option<usize>,
-    #[serde(default)]
     pub end_line: Option<usize>,
-    #[serde(default, alias = "summary", alias = "label")]
     pub title: String,
-    #[serde(default = "default_priority")]
     pub priority: u8,
-    #[serde(default = "default_confidence")]
     pub confidence: f32,
-    #[serde(default, alias = "comment", alias = "message", alias = "rationale")]
     pub body: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InlineCommentDraft {
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    start_line: Option<usize>,
+    #[serde(default)]
+    line: Option<usize>,
+    #[serde(default)]
+    line_number: Option<usize>,
+    #[serde(default)]
+    end_line: Option<usize>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default = "default_priority")]
+    priority: u8,
+    #[serde(default = "default_confidence")]
+    confidence: f32,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    rationale: String,
+}
+
+impl<'de> Deserialize<'de> for InlineComment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let draft = InlineCommentDraft::deserialize(deserializer)?;
+        Ok(Self {
+            file: first_nonempty_string([draft.file, draft.path]),
+            start_line: draft
+                .start_line
+                .or(draft.line)
+                .or(draft.line_number),
+            end_line: draft.end_line,
+            title: first_nonempty_string([draft.title, draft.summary, draft.label]),
+            priority: draft.priority,
+            confidence: draft.confidence,
+            body: first_nonempty_string([
+                draft.body,
+                draft.comment,
+                draft.message,
+                draft.rationale,
+            ]),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -240,6 +293,13 @@ fn normalize_string_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn first_nonempty_string<const N: usize>(values: [String; N]) -> String {
+    values
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -271,6 +331,27 @@ mod tests {
         let parsed: InlineComment = serde_json::from_value(value).expect("should deserialize");
         assert_eq!(parsed.start_line, Some(17));
         assert_eq!(parsed.body, "This should stay line-anchored.");
+    }
+
+    #[test]
+    fn deserializes_inline_comment_with_duplicate_alias_fields() {
+        let value = json!({
+            "file": "torch/_dynamo/utils.py",
+            "path": "ignored.py",
+            "start_line": 21,
+            "line": 22,
+            "line_number": 23,
+            "title": "Keep canonical title",
+            "summary": "ignored title",
+            "body": "Keep canonical body",
+            "comment": "ignored body"
+        });
+
+        let parsed: InlineComment = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.file, "torch/_dynamo/utils.py");
+        assert_eq!(parsed.start_line, Some(21));
+        assert_eq!(parsed.title, "Keep canonical title");
+        assert_eq!(parsed.body, "Keep canonical body");
     }
 
     #[test]
