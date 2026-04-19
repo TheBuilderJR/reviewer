@@ -249,7 +249,6 @@ impl CommandHandle {
     pub fn heartbeat(&self, elapsed_secs: f32) {
         let message = format!("{} ({elapsed_secs:.1}s elapsed)", self.label);
         self.reporter.emit_log("cmd", "INFO", &message);
-        self.bar.set_message(message);
     }
 
     pub fn done(&self, detail: impl AsRef<str>) {
@@ -276,7 +275,7 @@ impl CommandHandle {
 }
 
 fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner} {prefix:>7} {msg}")
+    ProgressStyle::with_template("{spinner} {prefix:>7} [{elapsed_precise}] {msg}")
         .expect("valid indicatif spinner template")
         .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   "])
 }

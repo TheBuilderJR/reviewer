@@ -1,6 +1,6 @@
 [package]
 name = "reviewer"
-version = "0.0.24"
+version = "0.0.25"
 edition = "2024"
 description = "Transparent PR review orchestration with Codex or Claude subprocesses"
 repository = "https://github.com/TheBuilderJR/reviewer"
