@@ -136,7 +136,6 @@ async fn main() -> Result<()> {
         repo_name,
         repo_path,
         provider_cwd,
-        user_request: None,
         parallelism: args.parallelism.max(1),
         keep_worktree: args.keep_worktree,
     };

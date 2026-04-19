@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::future::join_all;
 use tokio::sync::Semaphore;
 
@@ -31,7 +31,6 @@ pub struct ReviewOptions {
     pub repo_name: String,
     pub repo_path: PathBuf,
     pub provider_cwd: PathBuf,
-    pub user_request: Option<String>,
     pub parallelism: usize,
     pub keep_worktree: bool,
 }
@@ -233,11 +232,13 @@ async fn execute_build_phase(
                     result.commands_run.len()
                 ),
             };
-            match result.status.as_str() {
-                "passed" | "skipped" => step.done(detail),
-                _ => step.fail(detail),
+            if result.status == "passed" {
+                step.done(detail);
+                Ok(result)
+            } else {
+                step.fail(&detail);
+                Err(anyhow!("build phase failed: {}", result.summary))
             }
-            Ok(result)
         }
         Err(error) => {
             step.fail(error.to_string());
@@ -320,7 +321,6 @@ async fn review_files(
         let provider_cwd = options.provider_cwd.clone();
         let worktree_path = worktree.path.clone();
         let pr = pr.clone();
-        let user_request = options.user_request.clone();
         tasks.push(tokio::spawn(async move {
             review_single_file(
                 &semaphore,
@@ -329,7 +329,6 @@ async fn review_files(
                 &worktree_path,
                 &pr,
                 job,
-                user_request.as_deref(),
             )
             .await
         }));
@@ -356,9 +355,8 @@ async fn review_single_file(
     worktree_path: &PathBuf,
     pr: &PullRequestDetails,
     job: FileReviewJob,
-    user_request: Option<&str>,
 ) -> Result<FileReviewDraft> {
-    let prompt = build_file_review_prompt(pr, &job, worktree_path, provider_cwd, user_request);
+    let prompt = build_file_review_prompt(pr, &job, worktree_path, provider_cwd);
     let mut review: FileReviewDraft = invoke_with_semaphore(
         semaphore,
         provider.as_ref(),
@@ -759,7 +757,7 @@ fn validate_file_review(job: &FileReviewJob, review: &FileReviewDraft) -> Result
 
 fn validate_build_execution(result: &BuildExecution) -> Result<()> {
     anyhow::ensure!(
-        matches!(result.status.as_str(), "passed" | "failed" | "skipped"),
+        matches!(result.status.as_str(), "passed" | "failed"),
         "build phase returned unsupported status `{}`",
         result.status
     );
@@ -767,13 +765,11 @@ fn validate_build_execution(result: &BuildExecution) -> Result<()> {
         !result.summary.trim().is_empty(),
         "build phase returned an empty summary"
     );
-    if result.status != "skipped" {
-        anyhow::ensure!(
-            !result.commands_run.is_empty(),
-            "build phase must report at least one command when status is {}",
-            result.status
-        );
-    }
+    anyhow::ensure!(
+        !result.commands_run.is_empty(),
+        "build phase must report at least one command when status is {}",
+        result.status
+    );
     Ok(())
 }
 
@@ -825,19 +821,15 @@ fn validate_final_review(draft: &FinalReviewDraft) -> Result<()> {
 }
 
 fn normalize_build_execution(result: &mut BuildExecution) {
-    if !matches!(result.status.as_str(), "passed" | "failed" | "skipped") {
-        result.status = if result.commands_run.is_empty() {
-            "skipped".to_string()
-        } else {
-            "failed".to_string()
-        };
+    if !matches!(result.status.as_str(), "passed" | "failed") {
+        result.status = "failed".to_string();
     }
 
     if result.summary.trim().is_empty() {
         result.summary = fallback_build_summary(&result.status, result.commands_run.len());
     }
 
-    if result.status != "skipped" && result.commands_run.is_empty() {
+    if result.commands_run.is_empty() {
         result.commands_run.push(
             "Build agent did not report exact commands; inspect the transcript artifact."
                 .to_string(),
@@ -1062,11 +1054,9 @@ fn fallback_final_summary(findings: usize, comments: usize) -> String {
 fn fallback_build_summary(status: &str, command_count: usize) -> String {
     match status {
         "passed" => format!("Build/setup completed successfully after {command_count} command(s)."),
-        "failed" => format!(
+        _ => format!(
             "Build/setup failed after {command_count} command(s); inspect the transcript for details."
         ),
-        _ => "Build/setup was skipped because the agent could not find executable instructions."
-            .to_string(),
     }
 }
 
@@ -1124,7 +1114,6 @@ fn build_file_review_prompt(
     job: &FileReviewJob,
     worktree_path: &PathBuf,
     provider_cwd: &PathBuf,
-    user_request: Option<&str>,
 ) -> String {
     format!(
         "You are reviewing PR #{pr_number} ({pr_title}) in repo {repo_url}.\n\
@@ -1133,7 +1122,6 @@ fn build_file_review_prompt(
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          File change stats: +{additions} / -{deletions}\n\n\
-         User request:\n{user_request}\n\n\
          Current diff excerpt for the starting file:\n```diff\n{diff}\n```\n\n\
          Requirements:\n\
          - The harness launched you from `{provider_cwd}`, but the PR snapshot lives at `{worktree}`. If you run commands or inspect files, operate on the worktree path, not the launch cwd.\n\
@@ -1160,7 +1148,6 @@ fn build_file_review_prompt(
         base = pr.base_ref_name,
         additions = job.additions,
         deletions = job.deletions,
-        user_request = render_user_request(user_request),
         diff = job.diff_excerpt
     )
 }
@@ -1188,7 +1175,6 @@ fn build_repo_prompt(
          Worktree path: {worktree}\n\
          Base branch: {base}\n\
          PR URL: {pr_url}\n\n\
-         User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Task:\n\
          - You were launched from `{provider_cwd}`, but the PR snapshot lives at `{worktree}`. For any repo command, first `cd` into the worktree or otherwise target that path explicitly. Do not build from the launch cwd.\n\
@@ -1196,11 +1182,11 @@ fn build_repo_prompt(
          - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
          - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
          - Keep the run non-interactive.\n\
-         - If the build fails, stop after enough investigation to explain the blocker clearly.\n\
-         - If there is genuinely no usable build guidance in the reviewer instructions, return status `skipped` with a concrete explanation.\n\n\
+         - If the build fails, stop after enough investigation to explain the blocker clearly and return status `failed`.\n\
+         - If the reviewer instructions are missing, unusable, or do not contain executable build guidance, treat that as a hard failure and return status `failed` with a concrete explanation.\n\n\
          Return requirements:\n\
          - Return a compact JSON object with keys: `status`, `summary`, `commands_run`, `notes`.\n\
-         - `status` must be one of: passed, failed, skipped.\n\
+         - `status` must be one of: passed, failed.\n\
          - `commands_run` must contain the exact shell commands you actually executed, in order.\n\
          - `summary` should be a short plain-English result.\n\
          - `notes` must be a JSON array of strings. Use `[]` or `[\"...\"]`; never return a bare string for `notes`.\n\
@@ -1212,7 +1198,6 @@ fn build_repo_prompt(
         worktree = worktree.path.display(),
         base = pr.base_ref_name,
         pr_url = pr.url,
-        user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files
     )
 }
@@ -1264,7 +1249,6 @@ fn build_next_check_prompt(
          Base branch: {base}\n\
          Planning round: {round}/{max_rounds}\n\
          Existing planned checks: {existing_count}/{target_count}\n\n\
-         User request:\n{user_request}\n\n\
          Changed files:\n{changed_files}\n\n\
          Changed test-like files:\n{changed_test_files}\n\n\
          Build phase result:\n{build}\n\n\
@@ -1296,7 +1280,6 @@ fn build_next_check_prompt(
         max_rounds = max_rounds,
         existing_count = planned_checks.len(),
         target_count = target_count,
-        user_request = render_user_request(options.user_request.as_deref()),
         changed_files = changed_files,
         changed_test_files = changed_test_files,
         build = serde_json::to_string_pretty(build).unwrap_or_default(),
@@ -1321,7 +1304,6 @@ fn build_final_review_prompt(
          Agent launch cwd: {provider_cwd}\n\
          Worktree: {worktree}\n\
          Provider: {provider}\n\n\
-         User request:\n{user_request}\n\n\
          Build phase result:\n{build}\n\n\
          Per-file reviews:\n{file_reviews}\n\n\
          Executed checks:\n{checks}\n\n\
@@ -1344,7 +1326,6 @@ fn build_final_review_prompt(
         provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
         provider = "delegated-subprocess",
-        user_request = render_user_request(options.user_request.as_deref()),
         build = serde_json::to_string_pretty(build).unwrap_or_default(),
         file_reviews = serde_json::to_string_pretty(file_reviews).unwrap_or_default(),
         checks = serde_json::to_string_pretty(checks).unwrap_or_default()
@@ -1597,13 +1578,6 @@ fn looks_like_test_file(path: &str) -> bool {
         || lowered.ends_with(".spec.js")
         || lowered.ends_with(".test.ts")
         || lowered.ends_with(".test.js")
-}
-
-fn render_user_request(user_request: Option<&str>) -> String {
-    match user_request {
-        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => "No additional user request provided.".to_string(),
-    }
 }
 
 fn line_range_label(comment: &InlineComment) -> String {

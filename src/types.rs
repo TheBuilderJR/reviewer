@@ -280,7 +280,7 @@ fn default_confidence() -> f32 {
 }
 
 fn default_build_status() -> String {
-    "skipped".to_string()
+    "failed".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,7 +380,7 @@ mod tests {
         });
 
         let parsed: BuildExecution = serde_json::from_value(value).expect("should deserialize");
-        assert_eq!(parsed.status, "skipped");
+        assert_eq!(parsed.status, "failed");
         assert_eq!(parsed.summary, "Build could not run in this environment.");
         assert!(parsed.commands_run.is_empty());
     }
