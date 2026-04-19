@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::progress::ProgressReporter;
 use crate::runlog::RunLogger;
 use crate::shell::{
-    CommandProgress, capture_command_with_input_reported, run_command,
+    CommandProgress, capture_command_with_input_reported, capture_command_with_input_streamed,
+    run_command,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -152,11 +153,15 @@ impl Provider for CodexProvider {
             .run_logger
             .write_prompt(&invocation, "codex", &args, cwd, schema, &prompt)
             .await?;
+        let live_stream = self
+            .run_logger
+            .begin_live_subprocess_stream(&invocation, "codex")
+            .await?;
         let agent = self
             .progress
             .begin_agent(render_agent_label(label, &prompt_path));
 
-        let output = capture_command_with_input_reported(
+        let output = capture_command_with_input_streamed(
             "codex",
             &args,
             cwd,
@@ -165,6 +170,7 @@ impl Provider for CodexProvider {
                 self.progress.clone(),
                 render_command_label("codex", label),
             )),
+            Some(live_stream),
         )
             .await
             .context("codex invocation failed")?;

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::fs::OpenOptions;
+use tokio::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -21,6 +22,12 @@ pub struct InvocationLog {
     timestamp_secs: u64,
     sequence: u64,
     metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveStreamLogger {
+    transcript_path: PathBuf,
+    gate: std::sync::Arc<Mutex<()>>,
 }
 
 impl RunLogger {
@@ -119,6 +126,25 @@ impl RunLogger {
         Ok(response_path)
     }
 
+    pub async fn begin_live_subprocess_stream(
+        &self,
+        invocation: &InvocationLog,
+        provider: &str,
+    ) -> Result<LiveStreamLogger> {
+        let transcript_path = self.artifact_path(invocation, "initial-prompt", "txt");
+        self.append_to_path(
+            &transcript_path,
+            &format!(
+                "\n\n===== LIVE SUBPROCESS STREAM =====\nprovider: {provider}\n\n"
+            ),
+        )
+        .await?;
+        Ok(LiveStreamLogger {
+            transcript_path,
+            gate: std::sync::Arc::new(Mutex::new(())),
+        })
+    }
+
     pub async fn write_text(
         &self,
         invocation: &InvocationLog,
@@ -169,6 +195,61 @@ impl RunLogger {
         file.write_all(body.as_bytes())
             .await
             .with_context(|| format!("failed appending run artifact {}", path.display()))?;
+        Ok(())
+    }
+}
+
+impl LiveStreamLogger {
+    pub async fn append_stdout_chunk(&self, chunk: &str) -> Result<()> {
+        self.append_chunk("stdout", chunk).await
+    }
+
+    pub async fn append_stderr_chunk(&self, chunk: &str) -> Result<()> {
+        self.append_chunk("stderr", chunk).await
+    }
+
+    async fn append_chunk(&self, stream: &str, chunk: &str) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = self.gate.lock().await;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.transcript_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed opening run artifact {} for append",
+                    self.transcript_path.display()
+                )
+            })?;
+        file.write_all(format!("[{stream}] ").as_bytes())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed appending run artifact {}",
+                    self.transcript_path.display()
+                )
+            })?;
+        file.write_all(chunk.as_bytes())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed appending run artifact {}",
+                    self.transcript_path.display()
+                )
+            })?;
+        if !chunk.ends_with('\n') {
+            file.write_all(b"\n")
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed appending run artifact {}",
+                        self.transcript_path.display()
+                    )
+                })?;
+        }
         Ok(())
     }
 }
@@ -274,5 +355,43 @@ mod tests {
         assert!(transcript.contains("===== RESPONSE ====="));
         assert!(transcript.contains("subprocess_stdout:\nstdout text"));
         assert!(transcript.contains("subprocess_stderr:\nstderr text"));
+    }
+
+    #[tokio::test]
+    async fn appends_live_stream_chunks_to_prompt_transcript() {
+        let logger = RunLogger::create().await.expect("logger should create");
+        let invocation = logger.begin("review src/lib.rs");
+        let schema = json!({"type": "object"});
+        let prompt_path = logger
+            .write_prompt(
+                &invocation,
+                "codex",
+                &["exec".to_string()],
+                Path::new("/tmp"),
+                &schema,
+                "review this file",
+            )
+            .await
+            .expect("prompt should write");
+
+        let stream = logger
+            .begin_live_subprocess_stream(&invocation, "codex")
+            .await
+            .expect("stream should start");
+        stream
+            .append_stdout_chunk("progress line 1\n")
+            .await
+            .expect("stdout chunk should append");
+        stream
+            .append_stderr_chunk("thinking...\n")
+            .await
+            .expect("stderr chunk should append");
+
+        let transcript = tokio::fs::read_to_string(&prompt_path)
+            .await
+            .expect("transcript should read");
+        assert!(transcript.contains("===== LIVE SUBPROCESS STREAM ====="));
+        assert!(transcript.contains("[stdout] progress line 1"));
+        assert!(transcript.contains("[stderr] thinking..."));
     }
 }

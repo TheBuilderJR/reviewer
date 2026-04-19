@@ -4,10 +4,11 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::progress::ProgressReporter;
+use crate::runlog::LiveStreamLogger;
 
 const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -76,6 +77,17 @@ pub async fn capture_command_with_input_reported(
     stdin_text: Option<&str>,
     progress: Option<CommandProgress>,
 ) -> Result<CmdOutput> {
+    capture_command_with_input_streamed(program, args, cwd, stdin_text, progress, None).await
+}
+
+pub async fn capture_command_with_input_streamed(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    stdin_text: Option<&str>,
+    progress: Option<CommandProgress>,
+    live_stream: Option<LiveStreamLogger>,
+) -> Result<CmdOutput> {
     let active = begin_command_progress(progress);
 
     let mut command = Command::new(program);
@@ -132,25 +144,111 @@ pub async fn capture_command_with_input_reported(
         }
     }
 
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("failed waiting for {program}"));
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            finish_command_error(active, &error.to_string());
-            return Err(error);
-        }
+    let (stdout, stderr, status_code, success) = if let Some(live_stream) = live_stream {
+        let stdout_reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("stdout unavailable for {program}"));
+        let stdout_reader = match stdout_reader {
+            Ok(stdout_reader) => stdout_reader,
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(error);
+            }
+        };
+        let stderr_reader = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("stderr unavailable for {program}"));
+        let stderr_reader = match stderr_reader {
+            Ok(stderr_reader) => stderr_reader,
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(error);
+            }
+        };
+
+        let stdout_stream = live_stream.clone();
+        let stderr_stream = live_stream.clone();
+        let stdout_task = tokio::spawn(async move {
+            read_and_mirror_stream(stdout_reader, StreamKind::Stdout, stdout_stream).await
+        });
+        let stderr_task = tokio::spawn(async move {
+            read_and_mirror_stream(stderr_reader, StreamKind::Stderr, stderr_stream).await
+        });
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("failed waiting for {program}"));
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(error);
+            }
+        };
+
+        let stdout = match stdout_task.await {
+            Ok(result) => match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    finish_command_error(active, &error.to_string());
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(anyhow!("stdout reader task failed for {program}: {error}"));
+            }
+        };
+
+        let stderr = match stderr_task.await {
+            Ok(result) => match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    finish_command_error(active, &error.to_string());
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(anyhow!("stderr reader task failed for {program}: {error}"));
+            }
+        };
+
+        (
+            String::from_utf8_lossy(&stdout).to_string(),
+            String::from_utf8_lossy(&stderr).to_string(),
+            status.code(),
+            status.success(),
+        )
+    } else {
+        let output = child
+            .wait_with_output()
+            .await
+            .with_context(|| format!("failed waiting for {program}"));
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                finish_command_error(active, &error.to_string());
+                return Err(error);
+            }
+        };
+
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code(),
+            output.status.success(),
+        )
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let result = CmdOutput {
         stdout,
         stderr,
-        status_code: output.status.code(),
-        success: output.status.success(),
+        status_code,
+        success,
     };
     finish_command_result(active, &result);
     Ok(result)
@@ -179,6 +277,41 @@ struct ActiveCommand {
     progress: CommandProgress,
     started_at: Instant,
     ticker: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+async fn read_and_mirror_stream<R>(
+    mut reader: R,
+    kind: StreamKind,
+    live_stream: LiveStreamLogger,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut all = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .context("failed reading subprocess stream")?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        all.extend_from_slice(chunk);
+        let text = String::from_utf8_lossy(chunk);
+        match kind {
+            StreamKind::Stdout => live_stream.append_stdout_chunk(&text).await?,
+            StreamKind::Stderr => live_stream.append_stderr_chunk(&text).await?,
+        }
+    }
+    Ok(all)
 }
 
 fn begin_command_progress(progress: Option<CommandProgress>) -> Option<ActiveCommand> {
