@@ -14,7 +14,7 @@ For a GitHub PR, the harness:
 6. Writes a final review with an executive summary and inline comments like a real code review.
 7. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
 8. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
-9. Streams live progress to stderr for major phases and per-agent start/finish status.
+9. Shows polished live terminal progress while mirroring the full run transcript into a session log under the run directory.
 
 The harness assumes the selected CLI is already authenticated.
 
@@ -73,12 +73,13 @@ Optional controls:
 
 ## Notes
 
-- Progress is printed to stderr so it stays visible while the final Markdown report is still clean on stdout.
+- Reviewer now writes the rendered review to `/tmp/run_<uuid>/final-review.md` and `/tmp/run_<uuid>/final-review.json` by default, instead of dumping the final report to stdout.
+- A run-level `/tmp/run_<uuid>/session.log` captures the high-level progress stream and final outcome.
 - The harness does not impose subprocess timeouts. `git`, `gh`, provider invocations, and sequential checks all run until they exit on their own.
 - `~/.reviewer.md` still matters everywhere: the build agent, every file reviewer, the checks planner, and the final review writer all see that shared guidance.
 - The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in the final Markdown.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
-- Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`. The CLI prints the run directory path at the end, including on failure.
+- Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`.
 - Those per-invocation artifacts include the exact captured provider subprocess streams as `subprocess_stdout` and `subprocess_stderr`, so you can inspect the real CLI output instead of model-authored excerpts.
 - Sequential checks also write `check-command` and `check-result` artifacts under the same run directory.
 - Those artifact files now include the exact provider argv as JSON, so extra flags like `--dangerously-skip-permissions` are visible after the fact.

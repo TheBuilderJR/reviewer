@@ -47,6 +47,18 @@ impl RunLogger {
         &self.root
     }
 
+    pub fn session_log_path(&self) -> PathBuf {
+        self.root.join("session.log")
+    }
+
+    pub fn final_markdown_path(&self) -> PathBuf {
+        self.root.join("final-review.md")
+    }
+
+    pub fn final_json_path(&self) -> PathBuf {
+        self.root.join("final-review.json")
+    }
+
     pub fn begin(&self, metadata: &str) -> InvocationLog {
         InvocationLog {
             timestamp_secs: unix_timestamp_secs(),

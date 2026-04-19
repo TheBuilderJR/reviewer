@@ -75,105 +75,144 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let exit_code = match try_main().await {
+        Ok(()) => 0,
+        Err(_) => 1,
+    };
+    std::process::exit(exit_code);
+}
+
+async fn try_main() -> Result<()> {
     let args = Args::parse();
     let provider_cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let progress = Arc::new(ProgressReporter::new());
-    let prompt_preamble = load_prompt_preamble().await?;
     let run_logger = Arc::new(RunLogger::create().await?);
-    let extra_args = parse_extra_args(args.extra_args.as_deref())?;
-    let request = resolve_request(&args.pr, args.repo.as_deref())?;
-    let repo_path =
-        resolve_repo_checkout(args.repo_path.clone(), &request, progress.clone()).await?;
+    let progress = Arc::new(ProgressReporter::new(run_logger.session_log_path())?);
 
-    progress.info(
-        "run",
-        format!("artifacts -> {}", run_logger.root().display()),
-    );
-    progress.info(
-        "run",
-        format!(
-            "provider={} pr={} repo_path={}",
-            args.provider,
-            args.pr,
-            repo_path.display()
-        ),
-    );
+    let result: Result<()> = async {
+        let prompt_preamble = load_prompt_preamble().await?;
+        let extra_args = parse_extra_args(args.extra_args.as_deref())?;
+        let request = resolve_request(&args.pr, args.repo.as_deref())?;
+        let repo_path =
+            resolve_repo_checkout(args.repo_path.clone(), &request, progress.clone()).await?;
 
-    progress.info(
-        "config",
-        format!(
-            "loaded reviewer instructions from {}",
-            prompt_preamble.path.display()
-        ),
-    );
+        progress.info(
+            "run",
+            format!("artifacts -> {}", run_logger.root().display()),
+        );
+        progress.info(
+            "run",
+            format!("session log -> {}", run_logger.session_log_path().display()),
+        );
+        progress.info(
+            "run",
+            format!(
+                "provider={} pr={} repo_path={}",
+                args.provider,
+                args.pr,
+                repo_path.display()
+            ),
+        );
 
-    if extra_args.is_empty() {
-        progress.info("config", "no provider extra args configured");
-    } else {
         progress.info(
             "config",
-            format!("provider extra args: {}", extra_args.join(" ")),
+            format!(
+                "loaded reviewer instructions from {}",
+                prompt_preamble.path.display()
+            ),
+        );
+
+        if extra_args.is_empty() {
+            progress.info("config", "no provider extra args configured");
+        } else {
+            progress.info(
+                "config",
+                format!("provider extra args: {}", extra_args.join(" ")),
+            );
+        }
+
+        let provider = build_provider(
+            args.provider.into(),
+            args.model.clone(),
+            run_logger.clone(),
+            progress.clone(),
+            Some(prompt_preamble),
+            extra_args,
+        );
+
+        let repo_name = match &request.repo_name {
+            Some(repo) => repo.clone(),
+            None => github::resolve_repo_name(&repo_path, progress.clone()).await?,
+        };
+
+        let options = ReviewOptions {
+            pr_number: request.pr_number,
+            repo_name,
+            repo_path,
+            provider_cwd,
+            parallelism: args.parallelism.max(1),
+            keep_worktree: args.keep_worktree,
+        };
+
+        let report = run_review(
+            options,
+            provider.clone(),
+            run_logger.clone(),
+            progress.clone(),
+        )
+        .await?;
+        let markdown = render_markdown(&report);
+        let json = serde_json::to_string_pretty(&report)?;
+
+        let default_json_path = run_logger.final_json_path();
+        tokio::fs::write(&default_json_path, &json)
+            .await
+            .with_context(|| format!("failed writing {}", default_json_path.display()))?;
+
+        let default_markdown_path = run_logger.final_markdown_path();
+        tokio::fs::write(&default_markdown_path, &markdown)
+            .await
+            .with_context(|| format!("failed writing {}", default_markdown_path.display()))?;
+
+        if let Some(path) = args.output_json {
+            tokio::fs::write(&path, &json)
+                .await
+                .with_context(|| format!("failed writing {}", path.display()))?;
+        }
+
+        if let Some(path) = args.output_markdown {
+            tokio::fs::write(&path, &markdown)
+                .await
+                .with_context(|| format!("failed writing {}", path.display()))?;
+        }
+
+        progress.log_block("FINAL REVIEW MARKDOWN", &markdown);
+        progress.summary(
+            "done",
+            format!(
+                "review complete; report={} json={} artifacts={}",
+                default_markdown_path.display(),
+                default_json_path.display(),
+                run_logger.root().display()
+            ),
+        );
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &result {
+        progress.log_block("FINAL ERROR", &format!("{error:#}"));
+        progress.summary(
+            "fail",
+            format!(
+                "review failed; session_log={} artifacts={}",
+                run_logger.session_log_path().display(),
+                run_logger.root().display()
+            ),
         );
     }
 
-    let provider = build_provider(
-        args.provider.into(),
-        args.model.clone(),
-        run_logger.clone(),
-        progress.clone(),
-        Some(prompt_preamble),
-        extra_args,
-    );
-
-    let repo_name = match &request.repo_name {
-        Some(repo) => repo.clone(),
-        None => github::resolve_repo_name(&repo_path, progress.clone()).await?,
-    };
-
-    let options = ReviewOptions {
-        pr_number: request.pr_number,
-        repo_name,
-        repo_path,
-        provider_cwd,
-        parallelism: args.parallelism.max(1),
-        keep_worktree: args.keep_worktree,
-    };
-
-    let report = match run_review(
-        options,
-        provider.clone(),
-        run_logger.clone(),
-        progress.clone(),
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(error) => {
-            progress.info("run", format!("failed: {error}"));
-            eprintln!("Run artifacts: {}", run_logger.root().display());
-            return Err(error);
-        }
-    };
-    let markdown = render_markdown(&report);
-
-    if let Some(path) = args.output_json {
-        let json = serde_json::to_string_pretty(&report)?;
-        tokio::fs::write(&path, json)
-            .await
-            .with_context(|| format!("failed writing {}", path.display()))?;
-    }
-
-    if let Some(path) = args.output_markdown {
-        tokio::fs::write(&path, &markdown)
-            .await
-            .with_context(|| format!("failed writing {}", path.display()))?;
-    }
-
-    println!("{markdown}");
-    println!("Run artifacts: {}", run_logger.root().display());
-    progress.info("run", "completed successfully");
-    Ok(())
+    result
 }
 
 impl From<ProviderKind> for provider::ProviderKind {

@@ -274,8 +274,7 @@ fn trim_for_error(value: &str) -> String {
 }
 
 struct ActiveCommand {
-    progress: CommandProgress,
-    started_at: Instant,
+    handle: crate::progress::CommandHandle,
     ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -316,23 +315,17 @@ where
 
 fn begin_command_progress(progress: Option<CommandProgress>) -> Option<ActiveCommand> {
     progress.map(|progress| {
-        progress.reporter.command_start(&progress.label);
-        let started_at = Instant::now();
-        let heartbeat_started_at = started_at;
-        let reporter = progress.reporter.clone();
-        let label = progress.label.clone();
+        let handle = progress.reporter.begin_command(&progress.label);
+        let heartbeat_started_at = Instant::now();
+        let heartbeat_handle = handle.clone();
         let ticker = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(COMMAND_HEARTBEAT_INTERVAL).await;
-                reporter.command_heartbeat(&label, heartbeat_started_at.elapsed().as_secs_f32());
+                heartbeat_handle.heartbeat(heartbeat_started_at.elapsed().as_secs_f32());
             }
         });
 
-        ActiveCommand {
-            progress,
-            started_at,
-            ticker,
-        }
+        ActiveCommand { handle, ticker }
     })
 }
 
@@ -341,19 +334,12 @@ fn finish_command_result(active: Option<ActiveCommand>, output: &CmdOutput) {
         return;
     };
     active.ticker.abort();
-    let elapsed_secs = active.started_at.elapsed().as_secs_f32();
     if output.success {
-        active.progress.reporter.command_done(
-            &active.progress.label,
-            elapsed_secs,
-            format!("exit {}", output.status_code.unwrap_or(0)),
-        );
+        active
+            .handle
+            .done(format!("exit {}", output.status_code.unwrap_or(0)));
     } else {
-        active.progress.reporter.command_fail(
-            &active.progress.label,
-            elapsed_secs,
-            format!("exit {:?}", output.status_code),
-        );
+        active.handle.fail(format!("exit {:?}", output.status_code));
     }
 }
 
@@ -362,9 +348,5 @@ fn finish_command_error(active: Option<ActiveCommand>, error: &str) {
         return;
     };
     active.ticker.abort();
-    active.progress.reporter.command_fail(
-        &active.progress.label,
-        active.started_at.elapsed().as_secs_f32(),
-        error,
-    );
+    active.handle.fail(error);
 }
