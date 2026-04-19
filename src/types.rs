@@ -109,13 +109,18 @@ pub struct BuildExecution {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CheckSpec {
-    #[serde(default)]
+    #[serde(default, alias = "title", alias = "label", alias = "summary")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, alias = "cmd", alias = "run", alias = "script")]
     pub command: String,
-    #[serde(default, alias = "why")]
+    #[serde(default, alias = "why", alias = "reason", alias = "description")]
     pub rationale: String,
-    #[serde(default, alias = "expected")]
+    #[serde(
+        default,
+        alias = "expected",
+        alias = "signal",
+        alias = "success_criteria"
+    )]
     pub expected_signal: String,
     #[serde(default, alias = "related", deserialize_with = "deserialize_string_list")]
     pub related_findings: Vec<String>,
@@ -239,7 +244,7 @@ fn normalize_string_list(values: Vec<String>) -> Vec<String> {
 mod tests {
     use serde_json::json;
 
-    use super::{BuildExecution, CheckSpec, FileReviewDraft, InlineComment, ReviewFinding};
+    use super::{BuildExecution, CheckPlanDraft, CheckSpec, FileReviewDraft, InlineComment, ReviewFinding};
 
     #[test]
     fn deserializes_file_review_without_top_level_file() {
@@ -323,5 +328,37 @@ mod tests {
         let check: CheckSpec =
             serde_json::from_value(check_value).expect("check should deserialize");
         assert_eq!(check.related_findings, vec!["Missing assertion"]);
+    }
+
+    #[test]
+    fn deserializes_check_spec_common_aliases() {
+        let value = json!({
+            "title": "Run focused test",
+            "cmd": "pytest test/test_file.py -k case",
+            "description": "Exercise the changed path.",
+            "signal": "Command passes."
+        });
+
+        let parsed: CheckSpec = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.name, "Run focused test");
+        assert_eq!(parsed.command, "pytest test/test_file.py -k case");
+        assert_eq!(parsed.rationale, "Exercise the changed path.");
+        assert_eq!(parsed.expected_signal, "Command passes.");
+    }
+
+    #[test]
+    fn deserializes_check_plan_with_missing_names() {
+        let value = json!({
+            "summary": "Plan checks.",
+            "checks": [
+                {
+                    "command": "pytest test/test_file.py -k case"
+                }
+            ]
+        });
+
+        let parsed: CheckPlanDraft = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.checks.len(), 1);
+        assert_eq!(parsed.checks[0].name, "");
     }
 }

@@ -363,7 +363,7 @@ async fn plan_checks(
     progress.set_agent_total(1);
     let prompt = build_check_plan_prompt(options, pr, build, file_reviews, worktree);
     let plan_result: Result<CheckPlanDraft> = async {
-        let plan: CheckPlanDraft = invoke_typed(
+        let mut plan: CheckPlanDraft = invoke_typed(
             provider.as_ref(),
             &options.provider_cwd,
             &[worktree.path.clone()],
@@ -371,6 +371,7 @@ async fn plan_checks(
             &prompt,
         )
         .await?;
+        normalize_check_plan(&mut plan);
         validate_check_plan(&plan)?;
         Ok(plan)
     }
@@ -727,6 +728,39 @@ fn normalize_build_execution(result: &mut BuildExecution) {
     }
 }
 
+fn normalize_check_plan(plan: &mut CheckPlanDraft) {
+    if plan.summary.trim().is_empty() {
+        plan.summary = fallback_check_plan_summary(plan.checks.len());
+    }
+
+    for (index, check) in plan.checks.iter_mut().enumerate() {
+        normalize_check_spec(index, check);
+    }
+}
+
+fn normalize_check_spec(index: usize, check: &mut crate::types::CheckSpec) {
+    if check.name.trim().is_empty() {
+        check.name = first_nonempty_line(&check.command)
+            .map(|line| format!("Check {}: {}", index + 1, truncate_line(&line, 72)))
+            .or_else(|| {
+                first_nonempty_line(&check.rationale)
+                    .map(|line| format!("Check {}: {}", index + 1, truncate_line(&line, 72)))
+            })
+            .unwrap_or_else(|| format!("Check {}", index + 1));
+    }
+
+    if check.rationale.trim().is_empty() {
+        check.rationale = "Validate the changed behavior and guard against regressions."
+            .to_string();
+    }
+
+    if check.expected_signal.trim().is_empty() {
+        check.expected_signal =
+            "The command should complete successfully and confirm the expected behavior."
+                .to_string();
+    }
+}
+
 fn normalize_file_review(job: &FileReviewJob, review: &mut FileReviewDraft) {
     if review.file.trim().is_empty() {
         review.file = job.file.clone();
@@ -848,12 +882,27 @@ fn fallback_build_summary(status: &str, command_count: usize) -> String {
     }
 }
 
+fn fallback_check_plan_summary(check_count: usize) -> String {
+    format!("Planned {check_count} targeted post-review checks.")
+}
+
 fn first_nonempty_line(value: &str) -> Option<String> {
     value
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(ToString::to_string)
+}
+
+fn truncate_line(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().count();
+    if chars <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let shortened: String = trimmed.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{shortened}...")
 }
 
 async fn invoke_with_semaphore<T>(
@@ -1013,6 +1062,8 @@ fn build_check_plan_prompt(
          - If you inspect repo state, use the worktree path rather than the launch cwd.\n\
          - Return a compact JSON object with keys: `summary` and `checks`.\n\
          - Return at least 5 checks.\n\
+         - Every check object must include a non-empty `name` and a non-empty `command`.\n\
+         - Use the exact keys `name`, `command`, `rationale`, `expected_signal`, and `related_findings`. Do not substitute alternate key names.\n\
          - Check #1 must run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If no test files changed, choose the narrowest existing repro command for the changed behavior and make that check #1.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
          - Use the build phase result plus repo-specific guidance from the global reviewer instructions when choosing commands.\n\
