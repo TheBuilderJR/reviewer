@@ -259,9 +259,17 @@ mod tests {
             .await
             .expect("response should write");
 
-        let transcript = tokio::fs::read_to_string(&prompt_path)
-            .await
-            .expect("transcript should read");
+        let mut transcript = String::new();
+        for attempt in 0..10 {
+            transcript = tokio::fs::read_to_string(&prompt_path)
+                .await
+                .expect("transcript should read");
+            if transcript.contains("===== RESPONSE =====") {
+                break;
+            }
+            assert!(attempt < 9, "transcript never included appended response");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(transcript.contains("prompt:\nreview this file"));
         assert!(transcript.contains("===== RESPONSE ====="));
         assert!(transcript.contains("subprocess_stdout:\nstdout text"));
