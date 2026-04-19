@@ -1,4 +1,5 @@
 use schemars::JsonSchema;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +43,11 @@ pub struct ReviewFinding {
     pub rationale: String,
     #[serde(default, alias = "fix", alias = "suggestion")]
     pub suggested_fix: String,
-    #[serde(default, alias = "references")]
+    #[serde(
+        default,
+        alias = "references",
+        deserialize_with = "deserialize_string_list"
+    )]
     pub source_refs: Vec<String>,
 }
 
@@ -74,7 +79,7 @@ pub struct FileReviewDraft {
     pub findings: Vec<ReviewFinding>,
     #[serde(default)]
     pub inline_comments: Vec<InlineComment>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub notes: Vec<String>,
 }
 
@@ -86,7 +91,7 @@ pub struct FinalReviewDraft {
     pub summary_findings: Vec<ReviewFinding>,
     #[serde(default)]
     pub inline_comments: Vec<InlineComment>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub notes: Vec<String>,
 }
 
@@ -96,9 +101,9 @@ pub struct BuildExecution {
     pub status: String,
     #[serde(default, alias = "result")]
     pub summary: String,
-    #[serde(default, alias = "commands")]
+    #[serde(default, alias = "commands", deserialize_with = "deserialize_string_list")]
     pub commands_run: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub notes: Vec<String>,
 }
 
@@ -112,7 +117,7 @@ pub struct CheckSpec {
     pub rationale: String,
     #[serde(default, alias = "expected")]
     pub expected_signal: String,
-    #[serde(default, alias = "related")]
+    #[serde(default, alias = "related", deserialize_with = "deserialize_string_list")]
     pub related_findings: Vec<String>,
 }
 
@@ -131,6 +136,7 @@ pub struct CheckExecution {
     pub command: String,
     pub rationale: String,
     pub expected_signal: String,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub related_findings: Vec<String>,
     pub status: String,
     pub exit_code: Option<i32>,
@@ -154,6 +160,7 @@ pub struct FinalReviewReport {
     pub checks_summary: String,
     pub per_file: Vec<FileReviewDraft>,
     pub checks: Vec<CheckExecution>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub notes: Vec<String>,
 }
 
@@ -201,11 +208,38 @@ fn default_build_status() -> String {
     "skipped".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringList {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<StringList>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(StringList::One(value)) => normalize_string_list(vec![value]),
+        Some(StringList::Many(values)) => normalize_string_list(values),
+        None => Vec::new(),
+    })
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{BuildExecution, FileReviewDraft, InlineComment};
+    use super::{BuildExecution, CheckSpec, FileReviewDraft, InlineComment, ReviewFinding};
 
     #[test]
     fn deserializes_file_review_without_top_level_file() {
@@ -244,5 +278,50 @@ mod tests {
         assert_eq!(parsed.status, "skipped");
         assert_eq!(parsed.summary, "Build could not run in this environment.");
         assert!(parsed.commands_run.is_empty());
+    }
+
+    #[test]
+    fn deserializes_build_execution_with_scalar_lists() {
+        let value = json!({
+            "status": "passed",
+            "summary": "Completed build.",
+            "commands_run": "python setup.py develop",
+            "notes": "Imports succeeded afterward."
+        });
+
+        let parsed: BuildExecution = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.commands_run, vec!["python setup.py develop"]);
+        assert_eq!(parsed.notes, vec!["Imports succeeded afterward."]);
+    }
+
+    #[test]
+    fn deserializes_file_review_notes_string() {
+        let value = json!({
+            "summary": "Looks fine overall.",
+            "notes": "One follow-up note."
+        });
+
+        let parsed: FileReviewDraft = serde_json::from_value(value).expect("should deserialize");
+        assert_eq!(parsed.notes, vec!["One follow-up note."]);
+    }
+
+    #[test]
+    fn deserializes_other_scalar_string_lists() {
+        let finding_value = json!({
+            "title": "Missing assertion",
+            "references": "test/test_file.py"
+        });
+        let finding: ReviewFinding =
+            serde_json::from_value(finding_value).expect("finding should deserialize");
+        assert_eq!(finding.source_refs, vec!["test/test_file.py"]);
+
+        let check_value = json!({
+            "name": "Run focused test",
+            "command": "pytest test/test_file.py -k case",
+            "related": "Missing assertion"
+        });
+        let check: CheckSpec =
+            serde_json::from_value(check_value).expect("check should deserialize");
+        assert_eq!(check.related_findings, vec!["Missing assertion"]);
     }
 }

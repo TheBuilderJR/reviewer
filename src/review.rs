@@ -938,6 +938,7 @@ fn build_repo_prompt(
          - `status` must be one of: passed, failed, skipped.\n\
          - `commands_run` must contain the exact shell commands you actually executed, in order.\n\
          - `summary` should be a short plain-English result.\n\
+         - `notes` must be a JSON array of strings. Use `[]` or `[\"...\"]`; never return a bare string for `notes`.\n\
          - Omit fields you do not need instead of filling them with noise.",
         pr_number = pr.number,
         pr_title = pr.title,

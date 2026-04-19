@@ -416,6 +416,7 @@ fn add_json_output_contract(prompt: &str, output_path: &Path) -> String {
          - Write the final result JSON to this exact path: `{path}`\n\
          - The directory already exists and is writable.\n\
          - The file must contain a single raw JSON value matching the required schema exactly.\n\
+         - Respect JSON types exactly. If the schema expects an array, always return a JSON array even for one item. For example use `\"notes\": [\"...\"]`, not `\"notes\": \"...\"`.\n\
          - Do not wrap the file contents in markdown fences.\n\
          - After writing the file, print only a short confirmation such as `WROTE_JSON_FILE: {path}`.\n\
          - If the file write fails, print the raw JSON directly with no prose before or after it.\n",
