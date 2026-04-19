@@ -6,15 +6,18 @@ Rust CLI for PR review orchestration using either `codex` or `claude` as the rev
 
 For a GitHub PR, the harness:
 
-1. Fetches the PR and creates a detached git worktree.
-2. Runs an explicit build/setup phase in the PR worktree, driven by the instructions in `~/.reviewer.md`.
-3. Prepares one review job per changed file.
-4. Shells out to the selected provider for one reviewer per changed file, with each reviewer starting from that file but allowed to inspect nearby code in other files.
-5. Uses the build result plus those file reviews to plan targeted checks iteratively, usually aiming for 5 when there is enough signal, then runs the planned checks sequentially in the PR worktree.
-6. Writes a final review with an executive summary and inline comments like a real code review.
-7. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
-8. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
-9. Shows polished live terminal progress while mirroring the full run transcript into a session log under the run directory.
+1. Fetches the PR metadata and ref.
+2. Reuses or creates a persistent base worktree cache keyed by the current repo `HEAD` commit under `/tmp/reviewer-base-worktrees/...`.
+3. If that base cache is new, runs an explicit reusable base build/setup phase in the base worktree, driven by the instructions in `~/.reviewer.md`.
+4. Creates a detached review worktree from the base commit, seeds it with reusable top-level build artifacts copied from the base cache, then checks out the PR ref there.
+5. Runs the normal PR build/setup phase in the seeded review worktree so it can reuse those copied artifacts incrementally.
+6. Prepares one review job per changed file.
+7. Shells out to the selected provider for one reviewer per changed file, with each reviewer starting from that file but allowed to inspect nearby code in other files.
+8. Uses the build result plus those file reviews to plan targeted checks iteratively, usually aiming for 5 when there is enough signal, then runs the planned checks sequentially in the PR worktree.
+9. Writes a final review with an executive summary and inline comments like a real code review.
+10. Writes every model prompt and raw response to a per-run directory under `/tmp/run_<uuid>`.
+11. Requires `~/.reviewer.md` and prepends it to every model prompt as shared reviewer guidance.
+12. Shows polished live terminal progress while mirroring the full run transcript into a session log under the run directory.
 
 The harness assumes the selected CLI is already authenticated.
 
@@ -75,9 +78,10 @@ Optional controls:
 
 - Reviewer now writes the rendered review to `/tmp/run_<uuid>/final-review.md` and `/tmp/run_<uuid>/final-review.json` by default, instead of dumping the final report to stdout.
 - A run-level `/tmp/run_<uuid>/session.log` captures the high-level progress stream and final outcome.
+- Reviewer now keeps a persistent reusable base cache under `/tmp/reviewer-base-worktrees/...`, keyed by the current repo `HEAD` commit. That cache is built once per commit and then used to seed later PR worktrees for incremental rebuilds.
 - The harness does not impose subprocess timeouts. `git`, `gh`, provider invocations, and sequential checks all run until they exit on their own.
 - `~/.reviewer.md` still matters everywhere: the build agent, every file reviewer, the checks planner, and the final review writer all see that shared guidance.
-- The build phase is executed by the selected provider inside the PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in the final Markdown.
+- The build flow is executed by the selected provider inside both the reusable base worktree and the seeded PR worktree. It uses `~/.reviewer.md` as the primary source of truth for build/setup instructions and reports the commands it actually ran in the final Markdown.
 - Provider subprocess failures bubble up directly. If `claude` or `codex` is logged in but not actually usable for the org/account, the run will fail with the CLI error text.
 - Each provider invocation writes paired files such as `1776545033_initial-prompt_review-src-main-rs-<hash>_1.txt` and `1776545033_response_review-src-main-rs-<hash>_1.txt`.
 - Those per-invocation artifacts include the exact captured provider subprocess streams as `subprocess_stdout` and `subprocess_stderr`, so you can inspect the real CLI output instead of model-authored excerpts.

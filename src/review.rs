@@ -7,8 +7,9 @@ use futures::future::join_all;
 use tokio::sync::Semaphore;
 
 use crate::git::{
-    Worktree, cleanup_worktree, create_pr_worktree, diff_for_file, fetch_base_branch,
-    fetch_pr_head_ref,
+    BaseWorktree, Worktree, checkout_worktree_ref, cleanup_base_worktree, cleanup_worktree,
+    create_review_worktree_from_base, diff_for_file, ensure_base_worktree, fetch_base_branch,
+    fetch_pr_head_ref, mark_base_worktree_ready, seed_worktree_from_base,
 };
 use crate::github::fetch_pr_details;
 use crate::progress::ProgressReporter;
@@ -93,12 +94,83 @@ pub async fn run_review(
         }
     };
 
+    let base_worktree = {
+        let step = progress.begin_step("phase", "checking base worktree cache".to_string());
+        match ensure_base_worktree(&options.repo_path, progress.clone()).await {
+            Ok(status) => {
+                let detail = if status.reused {
+                    format!(
+                        "reusing {} @ {}",
+                        status.worktree.path.display(),
+                        short_commit(&status.worktree.commit_oid)
+                    )
+                } else {
+                    format!(
+                        "created {} @ {}",
+                        status.worktree.path.display(),
+                        short_commit(&status.worktree.commit_oid)
+                    )
+                };
+                step.done(detail);
+                status
+            }
+            Err(error) => {
+                step.fail(error.to_string());
+                return Err(error);
+            }
+        }
+    };
+
+    if !base_worktree.reused {
+        progress.set_agent_total(1);
+        if let Err(error) = execute_base_build_phase(
+            &options,
+            &pr,
+            &base_worktree.worktree,
+            provider.clone(),
+            progress.clone(),
+        )
+        .await
+        {
+            let cleanup_step =
+                progress.begin_step("phase", "discarding failed base worktree".to_string());
+            match cleanup_base_worktree(
+                &options.repo_path,
+                &base_worktree.worktree,
+                progress.clone(),
+            )
+            .await
+            {
+                Ok(()) => cleanup_step.done("failed base cache removed"),
+                Err(cleanup_error) => cleanup_step.fail(cleanup_error.to_string()),
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = mark_base_worktree_ready(&base_worktree.worktree) {
+            let cleanup_step =
+                progress.begin_step("phase", "discarding failed base worktree".to_string());
+            match cleanup_base_worktree(
+                &options.repo_path,
+                &base_worktree.worktree,
+                progress.clone(),
+            )
+            .await
+            {
+                Ok(()) => cleanup_step.done("unmarked base cache removed"),
+                Err(cleanup_error) => cleanup_step.fail(cleanup_error.to_string()),
+            }
+            return Err(error);
+        }
+    }
+
     let worktree = {
-        let step = progress.begin_step("phase", "creating worktree".to_string());
-        match create_pr_worktree(
+        let step = progress.begin_step("phase", "creating worktree from base cache".to_string());
+        match create_review_worktree_from_base(
             &options.repo_path,
             options.pr_number,
             &review_ref,
+            &base_worktree.worktree,
             progress.clone(),
         )
         .await
@@ -114,11 +186,57 @@ pub async fn run_review(
         }
     };
 
+    {
+        let step = progress.begin_step(
+            "phase",
+            "seeding review worktree from base cache".to_string(),
+        );
+        match seed_worktree_from_base(&base_worktree.worktree, &worktree).await {
+            Ok(artifact_roots) => {
+                let detail = if artifact_roots == 0 {
+                    "no reusable top-level artifacts found".to_string()
+                } else {
+                    format!(
+                        "{artifact_roots} reusable artifact roots copied from {}",
+                        base_worktree.worktree.path.display()
+                    )
+                };
+                step.done(detail);
+            }
+            Err(error) => {
+                step.fail(error.to_string());
+                return Err(error);
+            }
+        }
+    }
+
+    {
+        let step = progress.begin_step(
+            "phase",
+            format!("checking out PR #{} in seeded worktree", options.pr_number),
+        );
+        match checkout_worktree_ref(&worktree, &review_ref, options.pr_number, progress.clone())
+            .await
+        {
+            Ok(()) => step.done(review_ref.clone()),
+            Err(error) => {
+                step.fail(error.to_string());
+                return Err(error);
+            }
+        }
+    }
+
     let mut run_result = async {
         progress.set_agent_total(1);
-        let build =
-            execute_build_phase(&options, &pr, &worktree, provider.clone(), progress.clone())
-                .await?;
+        let build = execute_build_phase(
+            &options,
+            &pr,
+            &worktree,
+            &base_worktree.worktree,
+            provider.clone(),
+            progress.clone(),
+        )
+        .await?;
         let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
         progress.set_agent_total(jobs.len());
         let file_reviews = review_files(
@@ -192,35 +310,87 @@ pub async fn run_review(
 
     if let Ok(report) = run_result.as_mut() {
         report.run_artifact_dir = run_logger.root().display().to_string();
+        report.notes.push(format!(
+            "Review worktree was seeded from base cache {} at commit {}.",
+            base_worktree.worktree.path.display(),
+            short_commit(&base_worktree.worktree.commit_oid)
+        ));
     }
 
     run_result
+}
+
+async fn execute_base_build_phase(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    base_worktree: &BaseWorktree,
+    provider: Arc<dyn Provider>,
+    progress: Arc<ProgressReporter>,
+) -> Result<BuildExecution> {
+    let step = progress.begin_step("phase", "building base worktree".to_string());
+    let prompt = build_base_worktree_prompt(options, pr, base_worktree);
+    let build_result = run_build_invocation(
+        provider.as_ref(),
+        &options.provider_cwd,
+        &base_worktree.path,
+        &format!(
+            "build base worktree {}",
+            short_commit(&base_worktree.commit_oid)
+        ),
+        &prompt,
+    )
+    .await;
+
+    finish_build_step(step, build_result, "base worktree build phase failed")
 }
 
 async fn execute_build_phase(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     worktree: &Worktree,
+    base_worktree: &BaseWorktree,
     provider: Arc<dyn Provider>,
     progress: Arc<ProgressReporter>,
 ) -> Result<BuildExecution> {
     let step = progress.begin_step("phase", "building repo".to_string());
-    let prompt = build_repo_prompt(options, pr, worktree);
-    let build_result: Result<BuildExecution> = async {
-        let mut result: BuildExecution = invoke_typed(
-            provider.as_ref(),
-            &options.provider_cwd,
-            &[worktree.path.clone()],
-            &format!("build repo {}", pr.number),
-            &prompt,
-        )
-        .await?;
-        normalize_build_execution(&mut result);
-        validate_build_execution(&result)?;
-        Ok(result)
-    }
+    let prompt = build_repo_prompt(options, pr, worktree, base_worktree);
+    let build_result = run_build_invocation(
+        provider.as_ref(),
+        &options.provider_cwd,
+        &worktree.path,
+        &format!("build repo {}", pr.number),
+        &prompt,
+    )
     .await;
 
+    finish_build_step(step, build_result, "build phase failed")
+}
+
+async fn run_build_invocation(
+    provider: &dyn Provider,
+    provider_cwd: &PathBuf,
+    worktree_path: &PathBuf,
+    label: &str,
+    prompt: &str,
+) -> Result<BuildExecution> {
+    let mut result: BuildExecution = invoke_typed(
+        provider,
+        provider_cwd,
+        std::slice::from_ref(worktree_path),
+        label,
+        prompt,
+    )
+    .await?;
+    normalize_build_execution(&mut result);
+    validate_build_execution(&result)?;
+    Ok(result)
+}
+
+fn finish_build_step(
+    step: crate::progress::StepHandle,
+    build_result: Result<BuildExecution>,
+    failure_context: &str,
+) -> Result<BuildExecution> {
     match build_result {
         Ok(result) => {
             let detail = match result.commands_run.is_empty() {
@@ -237,7 +407,7 @@ async fn execute_build_phase(
                 Ok(result)
             } else {
                 step.fail(&detail);
-                Err(anyhow!("build phase failed: {}", result.summary))
+                Err(anyhow!("{failure_context}: {}", result.summary))
             }
         }
         Err(error) => {
@@ -1182,6 +1352,10 @@ fn wrap_check_command_for_execution(command: &str) -> String {
     }
 }
 
+fn short_commit(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
 fn first_nonempty_line(value: &str) -> Option<String> {
     value
         .lines()
@@ -1270,6 +1444,7 @@ fn build_repo_prompt(
     options: &ReviewOptions,
     pr: &PullRequestDetails,
     worktree: &Worktree,
+    base_worktree: &BaseWorktree,
 ) -> String {
     let changed_files = pr
         .files
@@ -1287,11 +1462,13 @@ fn build_repo_prompt(
         "You are the repo build phase agent for PR #{pr_number} ({pr_title}) in repo {repo}.\n\
          Agent launch cwd: {provider_cwd}\n\
          Worktree path: {worktree}\n\
+         Seeded base cache: {base_worktree} @ {base_commit}\n\
          Base branch: {base}\n\
          PR URL: {pr_url}\n\n\
          Changed files:\n{changed_files}\n\n\
          Task:\n\
          - You were launched from `{provider_cwd}`, but the PR snapshot lives at `{worktree}`. For any repo command, first `cd` into the worktree or otherwise target that path explicitly. Do not build from the launch cwd.\n\
+         - This PR worktree was seeded from `{base_worktree}`, which already contains reusable build artifacts from commit `{base_commit}`. Prefer incremental commands that reuse those artifacts when safe. Do not clean the build tree unless you have to.\n\
          - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built, prepared, or bootstrapped.\n\
          - Actually execute the build or setup flow from the worktree. Do not just recommend commands.\n\
          - Trust the reviewer instructions more than lightweight heuristics. If they specify a full build command, run it.\n\
@@ -1310,9 +1487,49 @@ fn build_repo_prompt(
         repo = options.repo_name,
         provider_cwd = options.provider_cwd.display(),
         worktree = worktree.path.display(),
+        base_worktree = base_worktree.path.display(),
+        base_commit = short_commit(&base_worktree.commit_oid),
         base = pr.base_ref_name,
         pr_url = pr.url,
         changed_files = changed_files
+    )
+}
+
+fn build_base_worktree_prompt(
+    options: &ReviewOptions,
+    pr: &PullRequestDetails,
+    base_worktree: &BaseWorktree,
+) -> String {
+    format!(
+        "You are preparing a reusable base build cache for repo {repo}.\n\
+         Agent launch cwd: {provider_cwd}\n\
+         Base worktree path: {worktree}\n\
+         Base worktree commit: {commit}\n\
+         Upcoming PR under review: #{pr_number} ({pr_title})\n\
+         PR URL: {pr_url}\n\n\
+         Task:\n\
+         - You were launched from `{provider_cwd}`, but the reusable base snapshot lives at `{worktree}`. For any repo command, first `cd` into the base worktree or otherwise target that path explicitly.\n\
+         - Read the global reviewer instructions loaded above and use them as the primary source of truth for how this repo should be built, prepared, or bootstrapped.\n\
+         - Your goal is to create a reusable baseline that future PR worktrees can clone from for incremental builds.\n\
+         - Actually execute the build or setup flow from the base worktree. Do not just recommend commands.\n\
+         - Because this is a reusable base cache, do not take a PR-specific lightweight validation-only fast path just because the upcoming PR changes are small or Python-only. Prefer the heaviest reusable local build/setup path the reviewer instructions support.\n\
+         - Keep the run non-interactive.\n\
+         - If the build fails, stop after enough investigation to explain the blocker clearly and return status `failed`.\n\
+         - If the reviewer instructions are missing, unusable, or do not contain executable build guidance, treat that as a hard failure and return status `failed` with a concrete explanation.\n\n\
+         Return requirements:\n\
+         - Return a compact JSON object with keys: `status`, `summary`, `commands_run`, `notes`.\n\
+         - `status` must be one of: passed, failed.\n\
+         - `commands_run` must contain the exact shell commands you actually executed, in order.\n\
+         - `summary` should be a short plain-English result.\n\
+         - `notes` must be a JSON array of strings. Use `[]` or `[\"...\"]`; never return a bare string for `notes`.\n\
+         - Omit fields you do not need instead of filling them with noise.",
+        repo = options.repo_name,
+        provider_cwd = options.provider_cwd.display(),
+        worktree = base_worktree.path.display(),
+        commit = short_commit(&base_worktree.commit_oid),
+        pr_number = pr.number,
+        pr_title = pr.title,
+        pr_url = pr.url
     )
 }
 
@@ -1781,9 +1998,11 @@ mod tests {
         );
 
         assert!(check.name.contains("Regression proof"));
-        assert!(check.command.contains(
-            "git -C \"$repo_root\" worktree add --detach \"$tmpdir\" HEAD"
-        ));
+        assert!(
+            check
+                .command
+                .contains("git -C \"$repo_root\" worktree add --detach \"$tmpdir\" HEAD")
+        );
         assert!(check.command.contains(
             "git checkout \"$base_ref\" -- 'torch/_dynamo/variables/higher_order_ops.py'"
         ));
